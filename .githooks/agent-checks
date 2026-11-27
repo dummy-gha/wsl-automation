@@ -1,0 +1,1882 @@
+#!/usr/bin/env bash
+# agent-checks: the fleet's commit-time rules, run by local git hooks and by CI.
+#
+# Locally it runs from config-based git hooks (Git 2.54+) that
+# acsi-agentskills' scripts/install-agent-hooks.sh installs once per machine.
+# CI runs the same file over a pull request's commits, and CI is the
+# enforcement: a hook can be skipped with --no-verify, a required check
+# cannot. See acsi-agentskills ADR 0020 and _agent-guidance ADR 0021.
+#
+# Managed by _agent-guidance (templates/agent-checks/). The sync overwrites
+# this file in every fleet repo, so change it there, not here.
+#
+# Usage:
+#   agent-checks pre-commit
+#   agent-checks pre-push <remote> <url>     (git's ref lines on stdin)
+#   agent-checks ci <base> <head>
+#   agent-checks tree [<rev>]                (every path in <rev>, default HEAD)
+#
+# `ci` also runs pr-tldr when GitHub Actions starts it for a pull request
+# (GITHUB_EVENT_NAME pull_request or pull_request_target, with
+# GITHUB_EVENT_PATH set): the pull request's description must begin with a
+# TLDR heading and text under it. It reads only the event payload, never the
+# API or the network; see "PR description: pr-tldr" below.
+#
+# `tree` is for measuring a check against a repo's whole current tree, so a new
+# check can be shown to refuse nothing already on a fleet repo's main.
+#
+# Any other event exits 0, so a machine whose installer registers an event
+# before this repo's copy of the runner knows it never blocks a commit.
+#
+# A repo adds checks of its own in .agent-checks/local.sh (see
+# run_local_checks below), outside .githooks/ because this file is overwritten.
+#
+# Each refusal says what is wrong, why, and how to fix it. That message is the
+# rule's documentation: an agent learns it when it breaks it, so the rule does
+# not need to sit in always-on guidance.
+#
+# After the refusing checks, every event but an unknown one runs one WARNING
+# pass, dated-phrasing (.githooks/dated-phrasing.js; see "Warning pass" below):
+# dated history and migration-relative phrasing in the Markdown agents load as
+# instructions. It prints `agent-checks (warning):` lines, or `::warning`
+# annotations in CI, and never changes the exit status. To keep a flagged line
+# that is right as written, add it to .agent-checks/dated-phrasing-allowlist.txt.
+#
+# local-identity refuses a changed file that holds this machine's own account
+# name in a home path, or its hostname; see "Local identity" below. The privacy
+# check applies those names, and a denylist file when one exists, to each pushed
+# ref name and commit message and identity; see "Privacy in ref names" below.
+#
+# Run log. Each pre-commit and pre-push run (never ci or tree) appends one JSON
+# line to $AGENT_CHECKS_LOG, by default
+# ${XDG_STATE_HOME:-$HOME/.local/state}/agent-checks/runs.jsonl, so a dashboard
+# can show how often each check runs and refuses, per repo, over time:
+#   {"v":1,"ts":"2026-10-26T12:00:00Z","event":"pre-commit","repo":"owner/name",
+#    "checks":["secret-file","skill-shell"],"failed":["secret-file"],
+#    "runner":"0123456789ab"}
+# `repo` is origin's GitHub owner/name, or null for any other remote. `checks`
+# are the ids of the checks that ran (dated-phrasing only when it read a file),
+# `failed` the ones that refused; a warning is never in `failed`. `runner` is
+# the first 12 hex digits of this file's own sha256, so a count can tell which
+# version of the runner a repo had, or null when no hash tool is found. The line
+# holds no paths, messages, branch names or user names. AGENT_CHECKS_LOG=off
+# turns it off. Logging is best effort: a failure is silent and never changes
+# the exit code or the output. In CI each refusal is also an `::error`
+# annotation titled `agent-checks <id>`, so a report can read the failed ids
+# from the check run's annotations.
+set -u
+
+# ── Lint tool pins (see "Lint pass") ─────────────────────────────────────────
+# Release binaries CI installs when a tool is not on PATH, each by exact version
+# and the sha256 of its archive, verified with `sha256sum -c`. Source of every
+# digest: the release's own assets (gh release view <tag> -R <repo> --json
+# assets), recomputed from a download. Versions are the newest release past 7
+# days when pinned. AGENT_CHECKS_LINT_TEST_SHA256 replaces the digest for the
+# tests, which serve their own archive; AGENT_CHECKS_LINT_FETCH replaces curl.
+LINT_SHELLCHECK_VERSION=0.11.0    # koalaman/shellcheck, released 2025-08-04
+LINT_SHELLCHECK_SHA256_X86_64=b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+LINT_SHELLCHECK_SHA256_AARCH64=68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc
+LINT_ACTIONLINT_VERSION=1.7.12    # rhysd/actionlint, released 2026-03-30
+LINT_ACTIONLINT_SHA256_AMD64=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+LINT_ACTIONLINT_SHA256_ARM64=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
+LINT_RUFF_VERSION=0.17.5          # astral-sh/ruff, released 2026-11-12
+LINT_RUFF_SHA256_X86_64=7d261fc981a784668e19e9fa6ad437bfd95b67f2dc263fc1eab87d54d72fcc90
+LINT_RUFF_SHA256_AARCH64=4d959d4322a8cd3effe11e9fc6743da1dbb41cd0b2476e433b6e6bfd9a69b626
+# PSScriptAnalyzer is a PowerShell Gallery module (no archive digest to pin):
+# installed by exact version, in CI only, and only when pwsh exists.
+LINT_PSSA_VERSION=1.25.0          # released 2026-03-20
+
+failed=0
+# The ids of the checks that ran and of those that refused, space-separated,
+# each once, in order. An id is a fixed kebab-case literal.
+ran_ids=""
+failed_ids=""
+
+# note_ran <id> — record that the check <id> ran.
+note_ran() {
+  case "$1" in ''|*[!a-z0-9-]*) return 0 ;; esac
+  case " $ran_ids " in *" $1 "*) ;; *) ran_ids="$ran_ids $1" ;; esac
+}
+
+# problem <id> <message> — refuse: print the message, record the check's id.
+problem() {
+  local id=$1
+  shift
+  case "$id" in
+    ''|*[!a-z0-9-]*) printf 'agent-checks: %s\n' "$*" >&2 ;;
+    *)
+      if [ "${GITHUB_ACTIONS:-}" = true ]; then
+        printf '::error title=agent-checks %s::agent-checks: %s\n' "$id" "$*" >&2
+      else
+        printf 'agent-checks: %s\n' "$*" >&2
+      fi
+      ;;
+  esac
+  failed=1
+  note_ran "$id"
+  case "$id" in ''|*[!a-z0-9-]*) return 0 ;; esac
+  case " $failed_ids " in *" $id "*) ;; *) failed_ids="$failed_ids $id" ;; esac
+}
+
+# Which commit's content the checks read: "index" for pre-commit, else the
+# revision being checked (pre-push: the pushed ref's commit; ci: the head;
+# tree: the revision named). Set by each event before it calls check_paths.
+content_rev=index
+
+# file_content <path> — print the blob for <path> in the content being
+# checked. Prints nothing, and succeeds, when that content has no such blob.
+file_content() {
+  local spec
+  if [ "$content_rev" = index ]; then
+    spec=":$1"
+  else
+    spec="$content_rev:$1"
+  fi
+  git cat-file -e "$spec" 2>/dev/null || return 0
+  git cat-file blob "$spec"
+}
+
+# ── Lesson checks ────────────────────────────────────────────────────────────
+# check_lessons <path> — called once for every path check_paths sees.
+#
+# The lesson-check lane (the fleet worker, _agent-guidance ADR 0027) adds
+# `case` arms here, one per lesson an agent learned, each with a refusal
+# through `problem` that says what is wrong, why, and how to fix it, and a
+# trailing `# lesson: <id>` comment. Read a file's content with file_content.
+# A refusal names the path and the rule only; it never prints file content,
+# which could be a secret.
+#
+# Each arm refuses with `problem lesson-<id> "..."`, and lists that same
+# check id in lesson_checks, so the run log counts the check as run.
+lesson_checks=""
+
+check_lessons() {
+  :
+}
+
+# Codex's limit for project instructions, in bytes: it truncates AGENTS.md at
+# this byte without any error, so the agents-md-size check refuses a change
+# that leaves the root AGENTS.md longer.
+CODEX_PROJECT_DOC_MAX_BYTES=32768
+
+# ── Local identity: local-identity ───────────────────────────────────────────
+# A public repo ships whatever is committed to everyone who clones it, and an
+# agent often pastes a path or a prompt from its own machine into a fixture or
+# a doc. The check refuses a changed file whose content holds THIS machine's
+# account name inside a home-directory path (/home/<user>, /Users/<user>, the
+# same with one or two backslashes, or Claude's project slug -home-<user>-) or
+# its hostname as a whole word (as reported, all upper or all lower case). A
+# bare occurrence of the account name is not flagged: it can be a piece of an
+# ordinary word.
+#
+# The identity comes from the machine the runner is on, so no name is written
+# in this file: AGENT_CHECKS_LOCAL_USER or `id -un`; AGENT_CHECKS_LOCAL_HOST or
+# `hostname -s` (else `uname -n` without its domain). The two variables, set
+# even to an empty value, replace the lookup (the tests set them). A name that
+# is empty, unavailable or generic is not checked: a user shorter than 3
+# characters or one of the names in local_generic_users; a host shorter than 4
+# characters, localhost, one of local_generic_hosts, or 12 or more lowercase
+# hex digits (a container id).
+# Under GitHub Actions (GITHUB_ACTIONS=true) the check never runs: a runner has
+# no personal identity, and a refusal must not print one to a public log. The
+# refusal names the path and line numbers only, never the identity; the run log
+# gets the id and nothing else. Both names are matched as literal text.
+local_generic_users=" root runner user ubuntu agent codex node vscode dev admin administrator codespace gitpod git nobody "
+# Hostnames that are ordinary words or stock image names, so a commit message
+# or file naming them ("move to ubuntu-latest", "fix the build") is not a leak.
+local_generic_hosts=" ubuntu debian fedora centos alpine arch raspberrypi build main master dev devbox server desktop laptop workstation runner home test "
+local_user=""
+local_host=""
+local_user_re=""
+local_host_re=""
+local_host_word_re=""
+
+# local_lower <text> — the text in lowercase.
+local_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# local_regex_escape <text> — the text with ERE metacharacters backslashed.
+local_regex_escape() { printf '%s' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g'; }
+
+# local_identity_init — set local_user and local_host to the names worth
+# checking (empty for one that is not), build the pattern for each once, and
+# record the check as run when at least one is.
+local_identity_init() {
+  local u h lower
+  local_user=""
+  local_host=""
+  local_user_re=""
+  local_host_re=""
+  local_host_word_re=""
+  [ "${GITHUB_ACTIONS:-}" = true ] && return 0
+  if [ -n "${AGENT_CHECKS_LOCAL_USER+x}" ]; then
+    u=$AGENT_CHECKS_LOCAL_USER
+  else
+    u=$(id -un 2> /dev/null) || u=""
+  fi
+  if [ -n "${AGENT_CHECKS_LOCAL_HOST+x}" ]; then
+    h=$AGENT_CHECKS_LOCAL_HOST
+  else
+    h=$(hostname -s 2> /dev/null) || h=""
+    if [ -z "$h" ]; then
+      h=$(uname -n 2> /dev/null) || h=""
+      h=${h%%.*}
+    fi
+  fi
+  case "$u" in *$'\n'*) u="" ;; esac
+  case "$h" in *$'\n'*) h="" ;; esac
+  lower=$(local_lower "$u")
+  if [ "${#u}" -ge 3 ]; then
+    case "$local_generic_users" in *" $lower "*) ;; *) local_user=$u ;; esac
+  fi
+  lower=$(local_lower "$h")
+  if [ "${#h}" -ge 4 ] && [ "$lower" != localhost ] && [[ "$local_generic_hosts" != *" $lower "* ]]; then
+    case "$lower" in
+      *[!0-9a-f]*) local_host=$h ;;
+      *) [ "${#h}" -ge 12 ] || local_host=$h ;;
+    esac
+  fi
+  if [ -n "$local_user" ]; then
+    u=$(local_regex_escape "$local_user")
+    local_user_re="(/home/|/Users/|\\\\{1,2}(home|Users)\\\\{1,2})$u([^A-Za-z0-9_-]|\$)|-home-$u-"
+  fi
+  if [ -n "$local_host" ]; then
+    for h in "$local_host" "$(printf '%s' "$local_host" | tr '[:lower:]' '[:upper:]')" "$(local_lower "$local_host")"; do
+      local_host_re="$local_host_re${local_host_re:+|}$(local_regex_escape "$h")"
+    done
+    # In a ref name or message a hyphen or underscore separates words
+    # (fix-<host>-thing), so the privacy check's boundary is any non-alphanumeric.
+    local_host_word_re="(^|[^A-Za-z0-9])($local_host_re)([^A-Za-z0-9]|\$)"
+    local_host_re="(^|[^A-Za-z0-9_-])($local_host_re)([^A-Za-z0-9_-]|\$)"
+  fi
+  if [ -n "$local_user$local_host" ]; then note_ran local-identity; fi
+}
+
+# The UTF-8 bytes of the Unicode spaces JavaScript's \s adds to ASCII ones:
+# U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000, U+FEFF.
+# printf builds the bytes at run time so this file stays ASCII. The skill-shell
+# check below matches them as bytes under LC_ALL=C.
+SKILL_SHELL_UNICODE_SPACE=$(printf '\302\240|\341\232\200|\342\200[\200-\212\250\251\257]|\342\201\237|\343\200\200|\357\273\277')
+
+# check_local_identity <path> — refuse the file when its content (text only:
+# grep -I skips binary) holds the account name in a home path or the hostname.
+check_local_identity() {
+  local path=$1 hits line what=""
+  [ -n "$local_user_re$local_host_re" ] || return 0
+  if [ -n "$local_user_re" ]; then
+    hits=$(file_content "$path" | LC_ALL=C grep -n -I -E -e "$local_user_re")
+    if [ -n "$hits" ]; then
+      line=${hits%%:*}
+      what="line $line holds this machine's account name in a home-directory path"
+    fi
+  fi
+  if [ -n "$local_host_re" ]; then
+    hits=$(file_content "$path" | LC_ALL=C grep -n -I -E -e "$local_host_re")
+    if [ -n "$hits" ]; then
+      line=${hits%%:*}
+      what="$what${what:+; }line $line holds this machine's hostname"
+    fi
+  fi
+  [ -n "$what" ] || return 0
+  problem local-identity "$path: $what. A public repo ships it to everyone who clones it. Replace it with a placeholder (/home/example, example-user) or name the machine by its role (the dev box, the build host). The identity is not printed here on purpose; the line numbers say where to look. If the name is there as data on purpose (a scrub rule that must spell it), commit once with AGENT_CHECKS_LOCAL_USER= or AGENT_CHECKS_LOCAL_HOST= set to empty."
+}
+
+# ── Privacy in ref names and commits: privacy ────────────────────────────────
+# local-identity reads changed file content only, so a branch name or a commit
+# message that holds this machine's names reaches the remote unchecked, and a
+# pushed branch name is public for good (a hostname once went out in two
+# branch names). The pre-push event therefore checks, for each pushed ref, its
+# name and the message and author and committer identity of every commit the
+# push adds, against two sources of patterns:
+#   always       the names local-identity uses: the account name in a home path
+#                and the hostname (as a whole word in any case, with - and _
+#                counting as separators, in a ref name, a message or an
+#                identity line);
+#   when present the denylist: PRIVACY_DENYLIST (newline-separated patterns),
+#                else the file PRIVACY_DENYLIST_FILE names, else
+#                ~/.config/privacy-denylist.txt. Its patterns are Python regular
+#                expressions matched case-insensitively, which is why the check
+#                is .githooks/privacy-denylist.py (the sync delivers it beside
+#                this file). With no python3 the runner warns and checks the
+#                local names only.
+# A refusal names the place (branch name, <sha> message, <sha> identity) and the
+# pattern number, never the matched text and never the pattern; the run log gets
+# the id and nothing else. Under GitHub Actions the local names are not checked
+# (see local_identity_init); the denylist is the CI-mode check's to run, below.
+#
+# The ci event scans the whole change against the same denylist (the
+# PRIVACY_DENYLIST secret, which the delivered workflow passes in env:): the
+# lines the range adds, each commit's message and identity, the branch name
+# (GITHUB_HEAD_REF) and the pull request's title and body, which the checker
+# reads from GITHUB_EVENT_PATH itself, so no event field is ever interpolated
+# into this shell. PRIVACY_CI_MODE says what a finding does:
+#   enforce  (the default) a match, or a checker that could not run, refuses;
+#   warn     the escape hatch: every such outcome is a ::warning:: line and the
+#            job still passes. Set AGENT_CHECKS_PRIVACY_CI=warn to use it.
+# A MISSING secret (or one with no pattern), python3 or privacy-denylist.py only
+# ever warns and skips the scan, in both modes: the runner is also synced to repos outside the managed fleet
+# and copied to adopters with no denylist, where failing closed would turn every
+# pull request red. Outside Actions the scan runs only when a denylist file
+# exists, and says nothing otherwise.
+PRIVACY_CI_MODE=${AGENT_CHECKS_PRIVACY_CI:-enforce}
+# privacy_warn <message> — one warning line, never a refusal.
+privacy_warn() {
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::warning title=privacy::%s\n' "$1" >&2
+  else
+    printf 'agent-checks (warning): %s\n' "$1" >&2
+  fi
+}
+
+# privacy_denylist_present — a denylist source exists (it may still be empty).
+privacy_denylist_present() {
+  local f=${PRIVACY_DENYLIST_FILE:-}
+  [ -n "${PRIVACY_DENYLIST:-}" ] && return 0
+  if [ -z "$f" ] && [ -n "${HOME:-}" ]; then f=$HOME/.config/privacy-denylist.txt; fi
+  [ -n "$f" ] && [ -f "$f" ]
+}
+
+# privacy_local_hit <text> — success when the text holds this machine's account
+# name in a home path or its hostname. The text is fed by here-string, never a
+# pipe into grep -q, so a long message cannot race the reader.
+privacy_local_hit() {
+  if [ -n "$local_user_re" ] && LC_ALL=C grep -q -E -e "$local_user_re" <<< "$1"; then return 0; fi
+  if [ -n "$local_host_word_re" ] && LC_ALL=C grep -q -i -E -e "$local_host_word_re" <<< "$1"; then return 0; fi
+  return 1
+}
+
+# privacy_push_ref <remote> <remote_ref> <local_oid> <remote_oid> — check one
+# pushed ref: its name, and the commits the push adds.
+privacy_push_ref() {
+  # $1, the remote, is not used: commits any remote already has are public,
+  # so a push to a fresh fork must not re-check them either.
+  local ref=$2 new=$3 old=$4 commits sha short out rc places place_hits="" privacy_script=${dated_dir:-.}/privacy-denylist.py
+  note_ran privacy
+  local_identity_init
+  # Only commits the remote has nowhere: a branch that merged or rebased onto
+  # main would otherwise drag main's already-public commits in, and no one can
+  # reword those.
+  if known_commit "$old"; then
+    commits=$(git rev-list "$new" --not "$old" --remotes 2> /dev/null) || commits=""
+  else
+    commits=$(git rev-list "$new" --not --remotes 2> /dev/null) || commits=""
+  fi
+  if [ -n "$local_user_re$local_host_re" ]; then
+    if privacy_local_hit "${ref#refs/*/}"; then place_hits="the ref name"; fi
+    for sha in $commits; do
+      short=${sha:0:12}
+      if privacy_local_hit "$(git log -1 --format='%B' "$sha" 2> /dev/null)"; then
+        place_hits="$place_hits${place_hits:+, }$short message"
+      fi
+      if privacy_local_hit "$(git log -1 --format='%an%n%ae%n%cn%n%ce' "$sha" 2> /dev/null)"; then
+        place_hits="$place_hits${place_hits:+, }$short identity"
+      fi
+    done
+  fi
+  if [ -n "$place_hits" ]; then
+    problem privacy "refusing this push: $place_hits holds this machine's account name or hostname, and a pushed ref name or commit message is public for good. Rename the branch (git branch -m) or reword the commit (git commit --amend, or git rebase -r for older ones) with a placeholder or the machine's role, then push again. An identity place is the commit's author or committer name or email: set a public identity (a users.noreply.github.com email) and rewrite it with git commit --amend --reset-author. The identity is not printed here on purpose. If it is there on purpose, push once with AGENT_CHECKS_LOCAL_USER= or AGENT_CHECKS_LOCAL_HOST= set to empty."
+  fi
+  privacy_denylist_present || return 0
+  if ! command -v python3 > /dev/null 2>&1 || [ ! -f "$privacy_script" ]; then
+    privacy_warn "privacy denylist skipped: python3 (or $privacy_script) is not available, so only this machine's own names were checked. Install Python 3 to check the denylist before a push."
+    return 0
+  fi
+  rc=0
+  out=$(python3 "$privacy_script" --repo . --ref "$ref" --commits-stdin <<< "$commits" 2> /dev/null) || rc=$?
+  places=$(printf '%s\n' "$out" | sed '1d' | sed 's/^ *//' | tr '\n' ';')
+  # Python exits 1 on an uncaught exception too, so 1 is a match only when the
+  # checker printed its FAILED: header.
+  if [ "$rc" = 1 ] && [ "${out#FAILED:}" = "$out" ]; then rc=2; fi
+  case "$rc" in
+    0|3) ;;
+    1) problem privacy "refusing this push: a denylisted term is in a ref name or commit the push would publish, and a pushed ref name or commit message is public for good. Fix the branch name (git branch -m) or reword the commit (git commit --amend, or git rebase -r), then push again. An identity place is the commit's author or committer name or email: set a public identity (a users.noreply.github.com email) and rewrite it with git commit --amend --reset-author. The places and pattern numbers follow (the number counts your denylist's patterns from 1, skipping comment and blank lines; the text is never printed): $places" ;;
+    *) problem privacy "the privacy denylist could not be checked (privacy-denylist.py exited $rc: an unreadable or invalid denylist, or git failing), so this push is held. Run python3 $privacy_script --repo . --ref <branch> to see the error, or fix the file." ;;
+  esac
+  return 0
+}
+
+# privacy_ci_finding <message> — a finding of the ci scan: a refusal when
+# enforcing, else a warning.
+privacy_ci_finding() {
+  if [ "$PRIVACY_CI_MODE" = enforce ]; then problem privacy "$1"; else privacy_warn "$1"; fi
+}
+
+# privacy_ci_missing — no usable denylist in a CI run: always a warning, never
+# a refusal, in either mode. The runner is also copied to repos that have no
+# denylist (scratch repos outside the managed fleet, outside adopters of the
+# kit), and failing closed would turn every pull request there red; the fleet's
+# drift report is what flags a managed repo that lost the secret.
+privacy_ci_missing() {
+  note_ran privacy
+  privacy_warn "privacy denylist skipped: no PRIVACY_DENYLIST secret is available to this run (or it holds no pattern; a fork pull request gets none), so this change was not scanned. Add the repository secret PRIVACY_DENYLIST (newline-separated regular expressions) and pass it in the workflow step's env: to scan every pull request."
+}
+
+# run_privacy_ci <base> <head> — the ci event's denylist scan (see above).
+run_privacy_ci() {
+  local base=$1 head=$2 commits out rc places privacy_script=${dated_dir:-.}/privacy-denylist.py
+  local -a args
+  if ! privacy_denylist_present; then
+    # No denylist: outside Actions that is the normal local case, so say nothing.
+    [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+    privacy_ci_missing
+    return 0
+  fi
+  note_ran privacy
+  if ! command -v python3 > /dev/null 2>&1 || [ ! -f "$privacy_script" ]; then
+    # A warning in both modes, like a missing secret: the sync can skip
+    # privacy-denylist.py (a gitignored dated-phrasing file), and an absent
+    # checker is not a finding. A checker that RAN and errored still refuses.
+    privacy_warn "the privacy denylist was not checked: python3 (or $privacy_script) is not available, so this change was not scanned. Install Python 3 (every GitHub-hosted runner has it) and make sure the sync delivered privacy-denylist.py."
+    return 0
+  fi
+  if known_commit "$base"; then
+    commits=$(git rev-list "$head" --not "$base" 2> /dev/null) || commits=""
+  else
+    commits=$(git rev-list -1 "$head" 2> /dev/null) || commits=""
+  fi
+  args=(--repo . --diff "$base" "$head" --commits-stdin)
+  [ -z "${GITHUB_HEAD_REF:-}" ] || args+=(--ref "refs/heads/$GITHUB_HEAD_REF")
+  [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "$GITHUB_EVENT_PATH" ] || args+=(--event-path "$GITHUB_EVENT_PATH")
+  rc=0
+  out=$(python3 "$privacy_script" "${args[@]}" <<< "$commits" 2> /dev/null) || rc=$?
+  places=$(printf '%s\n' "$out" | sed '1d' | sed 's/^ *//' | tr '\n' ';')
+  if [ "$rc" = 1 ] && [ "${out#FAILED:}" = "$out" ]; then rc=2; fi
+  case "$rc" in
+    0) ;;
+    3) [ "${GITHUB_ACTIONS:-}" != true ] || privacy_ci_missing ;;
+    1) privacy_ci_finding "a denylisted term is in this change (an added line, a commit message or identity, the branch name, or the pull request title or body). Remove or reword it; a commit message or identity needs a rewrite (git commit --amend, or git rebase -r), and the PR title and body can be edited in place. The places and pattern numbers follow (the number counts the denylist's patterns from 1, skipping comment and blank lines; the text is never printed): $places" ;;
+    *) privacy_ci_finding "the privacy denylist could not be checked (privacy-denylist.py exited $rc: an invalid denylist, an unreadable event file, or git failing), so this change was not scanned. Run python3 $privacy_script --repo . --diff <base> <head> to see the error." ;;
+  esac
+  return 0
+}
+
+# Reads NUL-separated paths on stdin and refuses the ones that must never be
+# committed, or the root AGENTS.md when it is too long for Codex.
+# The fleet checks below run first, then each lesson (a `case` arm in
+# check_lessons). A check of your own goes beside the fleet checks (the
+# commented example below).
+check_paths() {
+  local path
+  while IFS= read -r -d '' path; do
+    [ -n "$path" ] || continue
+    case "${path##*/}" in
+      .env.example|.env.sample|.env.template) ;;
+      .env|.env.*|*.pem|*.key|*.p12|*.pfx|id_rsa|id_ecdsa|id_ed25519)
+        problem secret-file "$path: looks like a secret or credential file, and git history in a public repo is public. Unstage it (git restore --staged -- '$path') and add it to .gitignore." ;;
+    esac
+    # A skill or command file that runs a shell command when it loads.
+    is_skill_file=false
+    case "${path##*/}" in SKILL.md) is_skill_file=true ;; esac
+    case "$path" in
+      .claude/commands/*.md|*/.claude/commands/*.md|plugins/*/commands/*.md) is_skill_file=true ;;
+    esac
+    # A here-string, not a pipe: grep -q exits at the first match, which can
+    # kill a writer still filling the pipe.
+    # Claude Code matches /(?<=^|\s)!`([^`]+)`/gm and an unanchored
+    # /```!\s*\n?([\s\S]*?)\n?```/g, and JavaScript's \s holds the Unicode
+    # spaces below. The match runs on bytes (LC_ALL=C), so the locale cannot
+    # hide a no-break space, and the fence opener may sit anywhere in a line.
+    if $is_skill_file \
+        && LC_ALL=C grep -Eq "(^|[[:space:]]|$SKILL_SHELL_UNICODE_SPACE)!\`|\`\`\`!" <<<"$(file_content "$path")"; then
+      problem skill-shell "$path: a line starts a shell command that Claude Code runs when the skill loads (an exclamation mark then a backtick, at line start or after any space including a Unicode one, or a backtick fence followed by an exclamation mark anywhere in a line). It runs before the model reads the skill, so no review and no prompt-injection defense sees it. Have the skill tell the agent to run the command, or move the command into a script the skill calls."
+    fi
+    # The root AGENTS.md, measured in bytes in the content being checked. It
+    # is counted in the run log only when the change touched that file.
+    if [ "$path" = AGENTS.md ]; then
+      note_ran agents-md-size
+      agents_size=$(file_content "$path" | wc -c)
+      agents_size=$((agents_size))
+      if [ "$agents_size" -gt "$CODEX_PROJECT_DOC_MAX_BYTES" ]; then
+        problem agents-md-size "$path: it is $agents_size bytes, over the ${CODEX_PROJECT_DOC_MAX_BYTES}-byte limit. Codex silently truncates project instructions at byte $CODEX_PROJECT_DOC_MAX_BYTES, so everything past it never reaches a Codex session, with no error. Shorten it until wc -c AGENTS.md prints $CODEX_PROJECT_DOC_MAX_BYTES or less: move detail into docs/ and link to it."
+      fi
+    fi
+    # TEMPLATE, commented out: a check of your own. Uncomment it, give it a
+    # kebab-case id, add `note_ran <id>` in run_checks so the run log counts
+    # it, and make the message say what is wrong, why, and how to fix it.
+    # Name the path; never print file content.
+    #
+    #   case "${path##*/}" in
+    #     *.orig|*.rej)
+    #       problem leftover-patch "$path: a .orig or .rej file is what a failed merge or patch leaves behind, and it does not belong in the repo. Delete it (git rm --cached -- '$path') and add its pattern to .gitignore." ;;
+    #   esac
+    check_lessons "$path" < /dev/null
+    check_local_identity "$path" < /dev/null
+  done
+}
+
+# ── Repo-local checks ────────────────────────────────────────────────────────
+# A repo's own rules live in .agent-checks/local.sh, which the sync never
+# touches. After the fleet checks, the runner starts it as a separate process,
+# `bash .agent-checks/local.sh <event>`, with the same NUL-separated path list
+# on stdin and AGENT_CHECKS_REV set to the commit being checked (empty for the
+# index), so it can read content with `git show "$AGENT_CHECKS_REV:<path>"`
+# (`git show ":<path>"` when empty). Its stderr passes through; a nonzero exit
+# refuses. It is a child, not sourced, so it can only add refusals: it cannot
+# skip, change or clear a fleet check. A symlink is not run.
+#
+# How to add one: commit .agent-checks/local.sh with LF line endings (add
+# `.agent-checks/* text eol=lf` to .gitattributes; bash fails on CRLF). Exit 0
+# to allow, nonzero to refuse, after printing on stderr what is wrong, why and
+# how to fix it; name the path, never print file content. Every event runs it,
+# so test it with `bash .githooks/agent-checks tree`. Example:
+#
+#   status=0
+#   while IFS= read -r -d '' path; do
+#     case "$path" in *.draft) echo "agent-checks (local): $path: drafts stay out of this repo. Move it to your notes." >&2; status=1 ;; esac
+#   done
+#   exit $status
+local_checks=.agent-checks/local.sh
+
+run_local_checks() {
+  local top rev rc=0
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  [ -f "$top/$local_checks" ] && [ ! -L "$top/$local_checks" ] || return 0
+  note_ran repo-local
+  rev=$content_rev
+  [ "$rev" = index ] && rev=""
+  (cd "$top" && AGENT_CHECKS_REV=$rev bash "$local_checks" "$event") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    problem repo-local "$local_checks (this repo's own checks) refused, exit $rc; its messages are above. Fix the cause, or fix the check in $local_checks if it is wrong."
+  fi
+}
+
+# ── Workflow expressions: gha-template-injection ─────────────────────────────
+# Untrusted data is escaped for the context it lands in, just before it lands
+# there (agents-md/base.md, Security). In a GitHub Actions `run:` or
+# github-script `script:`, GitHub pastes each ${{ }} value into the script text
+# before the shell or node parses it, so no quoting inside the script can
+# escape it. The encoding that context needs is to pass the value through
+# `env:` and read it as a variable.
+#
+# The check runs zizmor's template-injection audit (https://docs.zizmor.sh),
+# which parses the YAML and knows which expressions an outsider can steer, on
+# every changed workflow (.github/workflows/*.yml|yaml) and local action
+# (action.yml|yaml at the root or under .github/actions/). It refuses findings
+# of Medium or High severity; zizmor's Informational ones (an earlier step's
+# output, mostly) are left to review. It runs --offline and reads the content
+# being checked (the index, or the commit), copied into a temporary directory.
+#
+# zizmor is the pinned version below: one already on PATH at that version, or
+# a copy pip installs once, hash-checked, into
+# ${XDG_CACHE_HOME:-$HOME/.cache}/agent-checks/zizmor/<version>. Bump it by
+# replacing the version and every hash (the wheels' sha256 values on PyPI),
+# after the release is 7 days old. When neither python nor pip can provide it,
+# a local run warns and skips; CI refuses, because CI is the enforcement and
+# skipping there would pass a change nothing checked. AGENT_CHECKS_ZIZMOR names
+# a zizmor to use instead, with no install (the tests set it). Design and the coverage
+# matrix: docs/reference/context-escaping-checks.md in _agent-guidance.
+ZIZMOR_VERSION=1.31.1
+ZIZMOR_SHA256S="9696d3c10919a3a2eb086c102f1bc10717f53ef3700a0d6c55a709c274995476
+4a70ee3c2721122aff04d5bbad5e448d15384f45de2ecb3c9493fe9dac2bc95f
+d9b36840c560a8abe39d9ef3d077239aabf6d572c5c2b629c970592a617dbf6f
+d8a5f86fbf93e65e9d42de9eb4c1855d195c5e9cdeef4f228093ad6711bd8ee4
+58e878eb2dbd2c6183c105e1ac28c14f7dd1eca44a783f1fe2a69647d012c410
+c5ccb17fd820bb1ddc63cc9a715e97c063025487e585f640389a86d9dfc97cda
+385732e55ca152a013b0863213b67be32f94157775354b8ad23cc9c5d70cdc82
+e7fdf82d31cc67eb1d5030bf2372b25ee2a1c3ad05017e18da70ed138c4accd6
+d1d2cdc23e7b11f2d6cbda0df3bee62ee7993a60647650f51c316ccd33365469
+3b35b393e8d437e275c7e399047c9892ccc290f3fc5e6aeb9f65a5d3b2a470e0"
+
+# gha_unavailable <reason> — zizmor could not run: refuse in CI, warn locally.
+gha_unavailable() {
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    problem gha-template-injection "workflow expressions were not checked: $1 Re-run the job; if it keeps failing, fix the runner's python or network rather than the check."
+  else
+    printf 'agent-checks (warning): gha-template-injection skipped: %s CI still runs it.\n' "$1" >&2
+  fi
+}
+
+# gha_python — print a python that has pip, or nothing.
+gha_python() {
+  local py
+  for py in python3 python; do
+    if command -v "$py" > /dev/null 2>&1 && "$py" -m pip --version > /dev/null 2>&1; then
+      printf '%s\n' "$py"
+      return 0
+    fi
+  done
+}
+
+# zizmor_bin <python> — print the path of the pinned zizmor, installing it into
+# the cache first if needed; print nothing when it cannot.
+zizmor_bin() {
+  local py=$1 base dir tmp req h exe
+  if [ -n "${AGENT_CHECKS_ZIZMOR:-}" ]; then
+    [ -x "$AGENT_CHECKS_ZIZMOR" ] && printf '%s\n' "$AGENT_CHECKS_ZIZMOR"
+    return 0
+  fi
+  if command -v zizmor > /dev/null 2>&1 \
+      && [ "$(zizmor --version 2> /dev/null)" = "zizmor $ZIZMOR_VERSION" ]; then
+    command -v zizmor
+    return 0
+  fi
+  base=${XDG_CACHE_HOME:-}
+  [ -n "$base" ] || { [ -n "${HOME:-}" ] && base=$HOME/.cache; } || return 0
+  dir=$base/agent-checks/zizmor/$ZIZMOR_VERSION
+  for exe in bin/zizmor bin/zizmor.exe Scripts/zizmor.exe; do
+    [ -f "$dir/$exe" ] && { printf '%s\n' "$dir/$exe"; return 0; }
+  done
+  [ -n "$py" ] || return 0
+  mkdir -p "$base/agent-checks/zizmor" 2> /dev/null || return 0
+  tmp=$(mktemp -d "$base/agent-checks/zizmor/.install.XXXXXX") || return 0
+  req="zizmor==$ZIZMOR_VERSION"
+  for h in $ZIZMOR_SHA256S; do req="$req --hash=sha256:$h"; done
+  printf '%s\n' "$req" > "$tmp.req"
+  if "$py" -m pip install --quiet --disable-pip-version-check --no-deps \
+       --only-binary :all: --require-hashes --target "$tmp" -r "$tmp.req" > /dev/null 2>&1; then
+    [ -d "$dir" ] || mv "$tmp" "$dir" 2> /dev/null
+  fi
+  rm -rf "$tmp" "$tmp.req"
+  for exe in bin/zizmor bin/zizmor.exe Scripts/zizmor.exe; do
+    [ -f "$dir/$exe" ] && { printf '%s\n' "$dir/$exe"; return 0; }
+  done
+}
+
+# check_gha_injection <list> — run the audit on the workflow and action files
+# named in the NUL-separated path list.
+check_gha_injection() {
+  local list=$1 path work py zz out rc=0 n=0 findings line
+  work=$(mktemp -d) || { gha_unavailable "could not create a temp directory."; return; }
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      .github/workflows/*/*) continue ;;
+      .github/workflows/*.yml|.github/workflows/*.yaml) ;;
+      action.yml|action.yaml|.github/actions/*/action.yml|.github/actions/*/action.yaml) ;;
+      *) continue ;;
+    esac
+    case "$path" in *..*) continue ;; esac
+    mkdir -p "$work/$(dirname -- "$path")" && file_content "$path" > "$work/$path" || continue
+    [ -s "$work/$path" ] || { rm -f "$work/$path"; continue; }
+    n=$((n + 1))
+  done < "$list"
+  if [ "$n" -eq 0 ]; then rm -rf "$work"; return 0; fi
+  note_ran gha-template-injection
+  py=$(gha_python)
+  if [ -z "$py" ]; then
+    rm -rf "$work"
+    gha_unavailable "python with pip is not on PATH, so zizmor $ZIZMOR_VERSION could not be installed or its report read."
+    return
+  fi
+  zz=$(zizmor_bin "$py")
+  if [ -z "$zz" ]; then
+    rm -rf "$work"
+    gha_unavailable "zizmor $ZIZMOR_VERSION could not be installed with pip (offline, or no access to PyPI). It retries on the next run."
+    return
+  fi
+  out=$(cd "$work" && "$zz" --offline --no-progress --no-config --format json \
+          --collect=workflows,actions . 2> /dev/null) || rc=$?
+  rm -rf "$work"
+  # zizmor exits 0 with no findings and 10 to 14 with some; anything else is
+  # its own failure.
+  case "$rc" in
+    0|1[0-4]) ;;
+    *) gha_unavailable "zizmor $ZIZMOR_VERSION stopped with exit $rc."; return ;;
+  esac
+  findings=$("$py" -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    print("!"); sys.exit(0)
+for f in data:
+    if f.get("ident") != "template-injection":
+        continue
+    if f.get("determinations", {}).get("severity") not in ("Medium", "High"):
+        continue
+    locs = f.get("locations", [])
+    locs = [l for l in locs if l.get("symbolic", {}).get("kind") == "Primary"] or locs[:1]
+    for loc in locs[:1]:
+        local = loc.get("symbolic", {}).get("key", {}).get("Local", {})
+        p = local.get("given_path") or local.get("verbatim_path") or "?"
+        row = loc.get("concrete", {}).get("location", {}).get("start_point", {}).get("row", -1) + 1
+        p = p[2:] if p.startswith("./") else p
+        print("%s:%d" % (p.replace("\n", " "), row))
+' <<< "$out" 2> /dev/null) || findings="!"
+  if [ "$findings" = "!" ]; then
+    gha_unavailable "zizmor's report could not be read."
+    return
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    problem gha-template-injection "$line: a \${{ }} expression an outsider can steer (an event field, an input, a branch name) is pasted into a run: or script: before the shell or node parses it, so its value can run as code. Escape it for that context: pass it through the step's env: (NAME: \${{ ... }}) and read \"\$NAME\" in the shell, or process.env.NAME in github-script. Quoting inside the script does not help. Only if the value provably cannot carry code, add '# zizmor: ignore[template-injection]' with the reason on that line. Check with: zizmor --offline <file> (https://docs.zizmor.sh/audits/#template-injection)."
+  done <<< "$findings"
+}
+
+# ── Warning pass: dated phrasing ─────────────────────────────────────────────
+# .githooks/dated-phrasing.js warns about dated history and migration-relative
+# phrasing ("is now", "no longer", "moved to", an ISO date) in the Markdown
+# agents load as instructions: every AGENTS.md (its repo-specific half),
+# CLAUDE.md and SKILL.md, and agents-md/**. That text is read as the rule that
+# holds now, so a story about what changed, and when, goes stale there; it
+# belongs in docs/evidence/ or git (_agent-guidance#348). Its header lists the
+# phrases and the exemptions (code, quotes, HTML, URLs, link text).
+#
+# It only ever warns: it runs after the refusing checks, its output never
+# changes the exit status, and any failure of its own (no node or npm, an
+# offline install, an internal error) prints one warning line and moves on
+# (_agent-guidance ADR 0017: checks that grow out of the prompt audit warn).
+# Each warning line starts `agent-checks (warning):`, or is a `::warning`
+# annotation under GitHub Actions; it names the path, line and phrase only.
+#
+# It needs markdown-it (a real Markdown parse, never a line scan). The runner
+# installs the exact version .githooks/dated-phrasing/package-lock.json pins,
+# with `npm ci --ignore-scripts`, into a cache keyed by the lockfile's sha256,
+# ${XDG_CACHE_HOME:-$HOME/.cache}/agent-checks/dated-phrasing/<sha256> (under
+# $RUNNER_TEMP in CI), and reuses it after that. Nothing is installed when no
+# path in scope changed.
+#
+# To keep text that is right as written (a present-tense fact that uses a
+# listed phrase, a date that qualifies a measurement), add a line to this
+# repo's .agent-checks/dated-phrasing-allowlist.txt, which the sync never
+# touches:
+#   owner/repo path/to/AGENTS.md :: a few words from the flagged sentence
+# The entry silences the flagged paragraph, list item or heading whose source
+# holds those words. The format is in .githooks/dated-phrasing-allowlist.txt,
+# the fleet's own list, managed by _agent-guidance.
+dated_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || dated_dir=""
+
+# dated_warn <message> — one warning line, never a refusal. On stderr in both
+# forms (GitHub reads annotations from either stream), so a caller's command
+# substitution never captures it.
+dated_warn() {
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::warning title=dated-phrasing::%s\n' "$1" >&2
+  else
+    printf 'agent-checks (warning): %s\n' "$1" >&2
+  fi
+}
+
+# dated_modules — print the node_modules directory that holds markdown-it,
+# installing it on first use; on failure warn once and return 1.
+# AGENT_CHECKS_DATED_PHRASING_MODULES names a directory to use instead, for
+# the tests, which must not reach the network.
+dated_modules() {
+  local pkg=$dated_dir/dated-phrasing base key dir tmp
+  if [ -n "${AGENT_CHECKS_DATED_PHRASING_MODULES:-}" ]; then
+    printf '%s\n' "$AGENT_CHECKS_DATED_PHRASING_MODULES"
+    return 0
+  fi
+  if ! command -v npm > /dev/null 2>&1; then
+    dated_warn "dated-phrasing skipped: npm is not on PATH, so markdown-it cannot be installed. Install Node.js to get these warnings locally; CI still runs them."
+    return 1
+  fi
+  if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "${RUNNER_TEMP:-}" ]; then
+    base=$RUNNER_TEMP
+  elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+    base=$XDG_CACHE_HOME
+  elif [ -n "${HOME:-}" ]; then
+    base=$HOME/.cache
+  else
+    dated_warn "dated-phrasing skipped: neither XDG_CACHE_HOME nor HOME is set, so there is nowhere to install markdown-it."
+    return 1
+  fi
+  key=$(node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' \
+        "$pkg/package-lock.json" 2> /dev/null) || key=""
+  case "$key" in
+    ''|*[!0-9a-f]*)
+      dated_warn "dated-phrasing skipped: $pkg/package-lock.json is missing or unreadable."
+      return 1 ;;
+  esac
+  dir=$base/agent-checks/dated-phrasing/$key
+  if [ ! -f "$dir/node_modules/markdown-it/package.json" ]; then
+    # Install beside the final directory and rename into place, so a run that
+    # is interrupted, or races another, never leaves a half-installed cache.
+    if ! { mkdir -p "$base/agent-checks/dated-phrasing" \
+           && tmp=$(mktemp -d "$base/agent-checks/dated-phrasing/.install.XXXXXX") \
+           && cp "$pkg/package.json" "$pkg/package-lock.json" "$tmp/" \
+           && (cd "$tmp" && npm ci --ignore-scripts --no-audit --no-fund --loglevel=error) > /dev/null 2>&1; }; then
+      [ -n "${tmp:-}" ] && rm -rf "$tmp"
+      dated_warn "dated-phrasing skipped: installing markdown-it with npm ci failed (offline, or no access to the npm registry). It retries on the next run."
+      return 1
+    fi
+    [ -f "$dir/node_modules/markdown-it/package.json" ] || { rm -rf "$dir"; mv "$tmp" "$dir" 2> /dev/null; }
+    rm -rf "$tmp"
+    if [ ! -f "$dir/node_modules/markdown-it/package.json" ]; then
+      dated_warn "dated-phrasing skipped: markdown-it was installed but could not be moved into $dir."
+      return 1
+    fi
+  fi
+  printf '%s\n' "$dir/node_modules"
+}
+
+# run_dated_phrasing <list> — the warning pass over a NUL-separated path list.
+# It is counted in the run log (note_ran) only when it read a file.
+run_dated_phrasing() {
+  local list=$1 top rev count mods rc=0
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  [ -n "$dated_dir" ] && [ -f "$dated_dir/dated-phrasing.js" ] || return 0
+  if ! command -v node > /dev/null 2>&1; then
+    # Silent unless a path in scope changed, which needs no node to tell.
+    count=$(tr '\0' '\n' < "$list" | grep -vE '^evals/.*/seed/' \
+            | grep -cE '(^|/)(AGENTS|CLAUDE|SKILL)\.md$|^agents-md/.*\.md$') || count=0
+    [ "$count" -gt 0 ] && dated_warn "dated-phrasing skipped: node is not on PATH. Install Node.js to get these warnings locally; CI still runs them."
+    return 0
+  fi
+  count=$(cd "$top" && node "$dated_dir/dated-phrasing.js" --count-scope < "$list" 2> /dev/null) || count=""
+  case "$count" in
+    ''|*[!0-9]*) dated_warn "dated-phrasing skipped: it could not read the path list."; return 0 ;;
+    0) return 0 ;;
+  esac
+  mods=$(dated_modules) || return 0
+  note_ran dated-phrasing
+  rev=$content_rev
+  (cd "$top" && node "$dated_dir/dated-phrasing.js" --rev "$rev" --modules "$mods" < "$list") || rc=$?
+  [ "$rc" -eq 0 ] || dated_warn "dated-phrasing stopped with exit $rc; its warnings may be incomplete."
+  return 0
+}
+
+# ── PR description: pr-tldr ──────────────────────────────────────────────────
+# Every pull request description begins with a plain-English TLDR, so a reader
+# learns what changes and why before the detail. In the ci event of a
+# pull_request or pull_request_target run, with GITHUB_EVENT_PATH set, the
+# check reads the event payload GitHub wrote there (the pull request's body,
+# its author's type and its creation time) with node, and nothing else: no
+# API call, no network. A missing node or a payload it cannot read or parse
+# refuses (fail closed). Any other event, or no GITHUB_EVENT_PATH, skips it.
+#
+# The rule is lexical, so it gives the same answer every time:
+#   1. CRLF becomes LF; every HTML comment (<!-- ... -->, across lines too) is
+#      removed, and an unclosed <!-- hides everything after it, as GitHub
+#      renders it.
+#   2. Leading lines that are blank, or a "_Requested by ..._" attribution
+#      line, are skipped.
+#   3. The first line left must be an ATX heading whose text is TLDR or TL;DR
+#      (any case, an optional colon): "## TLDR", "# tl;dr:".
+#   4. Some line between it and the next heading (or the end) has text.
+#
+# Closing keywords. The same read also warns, never refuses, about every issue
+# or pull request the description would close: GitHub closes the target of
+# close, closes, closed, fix, fixes, fixed, resolve, resolves or resolved
+# (any case, an optional colon) followed by #N, owner/repo#N or an issue or
+# pull request URL, from any repo, and "For #N" does not. The match is
+# lexical, on the description after the comment removal above, and it prints
+# only the references, never the description. It applies to a pull request
+# opened before pr_tldr_cutoff too, and to a bot's.
+#
+# The payload is the description as it was when the run started: re-running
+# an old run reads the old text. The workflow's `edited` pull_request trigger
+# is what re-runs the check after the description changes.
+#
+# Pull requests opened before the rule shipped are exempt, so an open one is
+# not retro-failed: pr_tldr_cutoff is that moment.
+pr_tldr_cutoff=2026-11-03T00:00:00Z
+
+# pr_tldr_warn <message> — a warning line on stderr, never a refusal.
+pr_tldr_warn() {
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::warning::agent-checks (warning): %s\n' "$1" >&2
+  else
+    printf 'agent-checks (warning): %s\n' "$1" >&2
+  fi
+}
+
+run_pr_tldr() {
+  local verdict why msg js closes
+  case "${GITHUB_EVENT_NAME:-}" in
+    pull_request|pull_request_target) ;;
+    *) return 0 ;;
+  esac
+  [ -n "${GITHUB_EVENT_PATH:-}" ] || return 0
+  note_ran pr-tldr
+  if ! command -v node > /dev/null 2>&1; then
+    problem pr-tldr "pull request description: node is not on PATH, so the TLDR rule could not read the event payload and nothing was checked. Run this check where Node.js is installed (every GitHub-hosted runner has it)."
+    return 0
+  fi
+  # The script prints "<verdict> <author>": verdict ok, exempt, missing or
+  # empty; author bot or user. It exits nonzero when the payload cannot be
+  # read. It is held in a variable and fed on stdin, not written as a here-doc
+  # inside $( ), which older bash (macOS's 3.2) can misparse.
+  IFS= read -r -d '' js <<'JS' || true
+const fs = require("fs");
+const [file, cutoff] = process.argv.slice(2);
+let pr;
+try {
+  pr = JSON.parse(fs.readFileSync(file, "utf8")).pull_request;
+} catch (err) {
+  process.exit(3);
+}
+if (!pr || typeof pr !== "object") process.exit(3);
+const author = pr.user && pr.user.type === "Bot" ? "bot" : "user";
+const created = typeof pr.created_at === "string" ? Date.parse(pr.created_at) : NaN;
+let body = typeof pr.body === "string" ? pr.body : "";
+body = body.replace(/\r\n?/g, "\n").replace(/<!--[\s\S]*?-->/g, "");
+const open = body.indexOf("<!--");
+if (open >= 0) body = body.slice(0, open);
+// Closing keywords (see "Closing keywords" below): a second output line, the
+// issues and pull requests the description would close, each once.
+const closing = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?[ \t]+((?:[\w.-]+\/[\w.-]+)?#\d+|https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:issues|pull)\/\d+)/gi;
+const closes = [...new Set([...body.matchAll(closing)].map((m) => m[1]))];
+const closesLine = closes.length ? "\ncloses " + closes.join(" ") : "";
+if (!Number.isNaN(created) && created < Date.parse(cutoff)) {
+  console.log("exempt " + author + closesLine);
+  process.exit(0);
+}
+const lines = body.split("\n");
+let i = 0;
+while (i < lines.length && (/^\s*$/.test(lines[i]) || /^_Requested by .+_\s*$/.test(lines[i]))) i++;
+const tldr = /^ {0,3}#{1,6}[ \t]+TL;?DR[ \t]*:?[ \t]*#*[ \t]*$/i;
+const heading = /^ {0,3}#{1,6}([ \t]|$)/;
+let verdict = "missing";
+if (i < lines.length && tldr.test(lines[i])) {
+  verdict = "empty";
+  for (let j = i + 1; j < lines.length && !heading.test(lines[j]); j++) {
+    if (/\S/.test(lines[j])) {
+      verdict = "ok";
+      break;
+    }
+  }
+}
+console.log(verdict + " " + author + closesLine);
+JS
+  verdict=$(node - "$GITHUB_EVENT_PATH" "$pr_tldr_cutoff" <<< "$js" 2> /dev/null) || verdict=""
+  # An optional second line, "closes <ref> <ref> ...", names what the
+  # description would close; split it off so the verdict is the first line.
+  closes=""
+  case "$verdict" in
+    *$'\n'closes\ *) closes=${verdict#*$'\n'closes }; verdict=${verdict%%$'\n'*} ;;
+  esac
+  if [ -n "$closes" ]; then
+    pr_tldr_warn "pull request description: it uses a closing keyword, so merging this pull request closes these: $closes. If you meant only to reference one, drop the keyword (write \"For #N\", not \"Closes #N\")."
+  fi
+  case "$verdict" in
+    "ok "*|"exempt "*) return 0 ;;
+    "missing "*) why="it does not begin with a TLDR heading" ;;
+    "empty "*) why="its TLDR heading has no text under it" ;;
+    *)
+      problem pr-tldr "pull request description: the event payload at GITHUB_EVENT_PATH could not be read as a pull request event (unreadable, not JSON, or no pull_request object), so the TLDR rule was not checked. Re-run the check; if it fails again, the runner's event file is broken."
+      return 0 ;;
+  esac
+  msg="pull request description: $why. The pull request description must begin with a \"## TLDR\" heading followed by one to three plain-English sentences on what changes and why. Only HTML comments and a \"_Requested by ..._\" attribution line may come before it. Edit the description: editing it re-runs this check (re-running an old run does not, because it reads the description as it was when that run started)."
+  # A bot's pull request (Dependabot, a GitHub App, github-actions) is warned,
+  # not refused: this is the one place that decides it.
+  if [ "${verdict#* }" = bot ]; then
+    pr_tldr_warn "$msg The author is a bot, so this is a warning, not a refusal."
+    return 0
+  fi
+  problem pr-tldr "$msg"
+}
+
+# ── Lint pass: lint-required-<language> refusals and advisory warnings ───────
+# One pass over the files the event already considers changed (pre-commit: the
+# staged files; pre-push and ci: the files in the range; tree: every path),
+# dispatched by file type and never by repo config, so it works in every repo
+# with no setup (_agent-guidance ADR 0050, which delivers ADR 0049: code
+# quality comes from managed linters, not CodeQL).
+#
+#   shell: *.sh, *.bash, .githooks/*, extensionless with a sh-family shebang,
+#     checked by shellcheck
+#   python: *.py, checked by ruff
+#   workflows: .github/workflows/*.yml|yaml, checked by actionlint
+#   powershell: *.ps1 *.psm1 *.psd1, checked by PSScriptAnalyzer through pwsh
+#   javascript: *.js *.mjs *.cjs, node --check (syntax only)
+#   ruby: *.rb, ruby -wc (syntax only)
+#
+# Two tiers. REQUIRED refuses, as lint-required-<language>, over the WHOLE
+# changed file (an error anywhere in a file you touch is a bug): shellcheck
+# errors, ruff E9/F63/F7/F82 (syntax errors, undefined names, invalid
+# comparisons; not unused imports), actionlint errors (its runner-label kind is
+# advisory: a repo's own runner labels are not knowable here), PSScriptAnalyzer
+# Error and ParseError, and a failing node --check or ruby -c. ADVISORY prints
+# `agent-checks (warning):` lines (`::warning file=,line=` in CI) and never
+# changes the exit status: shellcheck at its default severity, ruff F/B/PLE/PLW,
+# W605 and the bug-shaped E7xx (no pure style: no UP, SIM or formatting),
+# PSScriptAnalyzer Warning, and actionlint's embedded shellcheck. In pre-commit, pre-push and ci only findings on CHANGED lines are
+# shown (the diff hunks), so existing code is burned down gradually, never made
+# a wall; tree shows all. At most 20 findings per file are printed, then a count.
+#
+# A repo's own config wins: shellcheck reads .shellcheckrc, ruff reads
+# ruff.toml, .ruff.toml or pyproject.toml [tool.ruff] (the advisory tier then
+# uses the repo's rule selection; the required select list is still applied
+# and the repo's exclude list respected), actionlint reads .github/actionlint.yaml,
+# PSScriptAnalyzer gets PSScriptAnalyzerSettings.psd1 from the repo root as
+# -Settings. They are read from the content being checked.
+#
+# Opt out in .agent-checks/lint.conf (committed; the sync never touches it),
+# lines of `key=value`, `#` comments, parsed as data (never sourced or eval'd):
+#   required=off        no refusals from this pass     advisory=off   no warnings
+#   python=off          both tiers for one language    python.advisory=off  one tier
+#   exclude=docs/*/snippets/*    a path glob to leave out (repeatable; letters,
+#                                digits and _ . / * ? - only; * also crosses /)
+# Languages: shell python workflow powershell javascript ruby. Values: on, off.
+# AGENT_CHECKS_LINT=off (or `required`/`advisory`: only that tier) does the same
+# for one run. Unknown lines print one warning and are ignored.
+#
+# Tools. Locally a tool that is not on PATH skips its language with one notice
+# and never refuses or touches the network. In CI (GITHUB_ACTIONS=true) a
+# missing shellcheck, actionlint or ruff is downloaded as its release binary at
+# the version and sha256 pinned at the top of this file, checked with
+# `sha256sum -c`, into a temp directory; a failed download or a digest mismatch
+# REFUSES (lint-tool-install), because CI is the enforcement. PSScriptAnalyzer
+# is installed pinned with Install-PSResource in CI only when pwsh exists. A
+# pwsh, node or ruby that is missing is a notice, never a refusal. The tools
+# read a copy of the content being checked in a temp directory, never the
+# worktree, and file names are passed after `--`.
+#
+# Bump a pin by replacing the version and digests together, after the release
+# is 7 days old (gh release view <tag> -R <repo> --json assets lists digests).
+lint_conf=.agent-checks/lint.conf
+lint_tried=""
+lint_notified=""
+lint_cfg=""
+lint_excl=""
+lint_mode=changed
+lint_diff=()
+lint_root=""
+lint_tree=""
+lint_meta=""
+lint_rc=0
+lint_installed=""
+lint_cap=20
+
+# lint_gh_data <text> — a GitHub workflow-command message, escaped.
+lint_gh_data() {
+  local s=$1
+  s=${s//'%'/%25}
+  s=${s//$'\r'/%0D}
+  s=${s//$'\n'/%0A}
+  printf '%s' "$s"
+}
+
+# lint_gh_prop <text> — a workflow-command property value, escaped.
+lint_gh_prop() {
+  local s
+  s=$(lint_gh_data "$1")
+  s=${s//':'/%3A}
+  s=${s//','/%2C}
+  printf '%s' "$s"
+}
+
+# lint_warn <message> — one notice or warning, never a refusal.
+lint_warn() {
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::warning title=agent-checks lint::%s\n' "$(lint_gh_data "$1")" >&2
+  else
+    printf 'agent-checks (warning): %s\n' "$1" >&2
+  fi
+}
+
+# lint_notice_once <key> <message> — lint_warn, once per run for a key.
+lint_notice_once() {
+  case " $lint_notified " in *" $1 "*) return 0 ;; esac
+  lint_notified="$lint_notified $1"
+  lint_warn "$2"
+}
+
+# lint_cfg_get <key> — the last value set for a key in lint.conf, or nothing.
+lint_cfg_get() {
+  local w v=""
+  for w in $lint_cfg; do
+    case "$w" in "$1="*) v=${w#*=} ;; esac
+  done
+  printf '%s' "$v"
+}
+
+# lint_conf_load — read .agent-checks/lint.conf from the content being checked.
+lint_conf_load() {
+  local text line key val base tier n=0 ok
+  lint_cfg=""
+  lint_excl=""
+  text=$(file_content "$lint_conf")
+  [ -n "$text" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line%%'#'*}
+    line=${line//[[:space:]]/}
+    [ -n "$line" ] || continue
+    ok=false
+    case "$line" in
+      exclude=*)
+        val=${line#*=}
+        case "$val" in
+          ''|*[!A-Za-z0-9_./*?-]*) ;;
+          *) ok=true; lint_excl="$lint_excl$val"$'\n' ;;
+        esac
+        if $ok; then continue; fi ;;
+      *=*)
+        key=${line%%=*}
+        val=${line#*=}
+        base=${key%%.*}
+        tier=""
+        case "$key" in *.*) tier=${key#*.} ;; esac
+        case "$val" in on|off)
+          case "$base" in
+            required|advisory) [ -z "$tier" ] && ok=true ;;
+            shell|python|workflow|powershell|javascript|ruby)
+              case "$tier" in ''|required|advisory) ok=true ;; esac ;;
+          esac ;;
+        esac ;;
+    esac
+    if $ok; then
+      lint_cfg="$lint_cfg $key=$val"
+    else
+      lint_warn "$lint_conf line $n is not 'key=value' with a known key (required, advisory, shell, python, workflow, powershell, javascript, ruby, optionally .required or .advisory) and on or off, so it was ignored."
+    fi
+  done <<< "$text"
+}
+
+# lint_on <language> <tier> — succeeds when the tier is enabled for the language.
+lint_on() {
+  local v k
+  case "${AGENT_CHECKS_LINT:-}" in
+    off) return 1 ;;
+    required) [ "$2" = required ] || return 1 ;;
+    advisory) [ "$2" = advisory ] || return 1 ;;
+  esac
+  for k in "$1.$2" "$1" "$2"; do
+    v=$(lint_cfg_get "$k")
+    if [ -n "$v" ]; then [ "$v" = on ]; return; fi
+  done
+  return 0
+}
+
+# lint_arch — the pinned binaries' architecture name on Linux, else nothing.
+lint_arch() {
+  case "$(uname -s 2> /dev/null)/$(uname -m 2> /dev/null)" in
+    Linux/x86_64|Linux/amd64) echo x86_64 ;;
+    Linux/aarch64|Linux/arm64) echo aarch64 ;;
+  esac
+}
+
+# lint_pin <tool> — set lint_pin_url, lint_pin_sha and lint_pin_member for the
+# tool's release archive on this platform; fail when there is none.
+lint_pin() {
+  local a v
+  a=$(lint_arch)
+  lint_pin_url="" lint_pin_sha="" lint_pin_member=""
+  case "$1/$a" in
+    shellcheck/x86_64) v=$LINT_SHELLCHECK_VERSION; lint_pin_sha=$LINT_SHELLCHECK_SHA256_X86_64
+      lint_pin_url=https://github.com/koalaman/shellcheck/releases/download/v$v/shellcheck-v$v.linux.x86_64.tar.gz ;;
+    shellcheck/aarch64) v=$LINT_SHELLCHECK_VERSION; lint_pin_sha=$LINT_SHELLCHECK_SHA256_AARCH64
+      lint_pin_url=https://github.com/koalaman/shellcheck/releases/download/v$v/shellcheck-v$v.linux.aarch64.tar.gz ;;
+    actionlint/x86_64) v=$LINT_ACTIONLINT_VERSION; lint_pin_sha=$LINT_ACTIONLINT_SHA256_AMD64
+      lint_pin_url=https://github.com/rhysd/actionlint/releases/download/v$v/actionlint_${v}_linux_amd64.tar.gz ;;
+    actionlint/aarch64) v=$LINT_ACTIONLINT_VERSION; lint_pin_sha=$LINT_ACTIONLINT_SHA256_ARM64
+      lint_pin_url=https://github.com/rhysd/actionlint/releases/download/v$v/actionlint_${v}_linux_arm64.tar.gz ;;
+    ruff/x86_64) v=$LINT_RUFF_VERSION; lint_pin_sha=$LINT_RUFF_SHA256_X86_64
+      lint_pin_url=https://github.com/astral-sh/ruff/releases/download/$v/ruff-x86_64-unknown-linux-gnu.tar.gz ;;
+    ruff/aarch64) v=$LINT_RUFF_VERSION; lint_pin_sha=$LINT_RUFF_SHA256_AARCH64
+      lint_pin_url=https://github.com/astral-sh/ruff/releases/download/$v/ruff-aarch64-unknown-linux-gnu.tar.gz ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    shellcheck) lint_pin_member=shellcheck-v$v/shellcheck ;;
+    actionlint) lint_pin_member=actionlint ;;
+    ruff) lint_pin_member=ruff-$(lint_arch)-unknown-linux-gnu/ruff ;;
+  esac
+  # A test supplies its own archive and digest; the real pins cannot match one.
+  [ -z "${AGENT_CHECKS_LINT_TEST_SHA256:-}" ] || lint_pin_sha=$AGENT_CHECKS_LINT_TEST_SHA256
+  return 0
+}
+
+# lint_fetch <url> <dest> — download. AGENT_CHECKS_LINT_FETCH names a command
+# to run as `<command> <url> <dest>` instead of curl (the tests set it).
+lint_fetch() {
+  if [ -n "${AGENT_CHECKS_LINT_FETCH:-}" ]; then
+    "$AGENT_CHECKS_LINT_FETCH" "$1" "$2"
+  else
+    curl --fail --silent --show-error --location --retry 2 --proto '=https' --output "$2" -- "$1"
+  fi
+}
+
+# lint_sha256_ok <file> <digest> — the file's sha256 equals the digest.
+lint_sha256_ok() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    printf '%s  %s\n' "$2" "$1" | sha256sum -c --quiet - > /dev/null 2>&1
+  else
+    printf '%s  %s\n' "$2" "$1" | shasum -a 256 -c --quiet - > /dev/null 2>&1
+  fi
+}
+
+# lint_install <tool> — CI only: install the pinned release binary into the
+# pass's temp directory and set lint_installed to its path. A failed download
+# or digest refuses (fails closed). A platform with no pin at all (Windows or
+# macOS runners) skips with a notice instead: there is nothing to install, and
+# the fleet's required lint runs on the ubuntu agent-checks job. Refusing there
+# turned acsi-agentskills' Windows pytest job red on every runner test.
+lint_install() {
+  local t=$1 dir archive
+  lint_installed=""
+  if ! lint_pin "$t"; then
+    lint_notice_once "$t" "lint skipped: $t is not on PATH and no pinned release binary exists for this platform ($(uname -s 2> /dev/null) $(uname -m 2> /dev/null)), so its files were not linted here. The ubuntu agent-checks job lints them."
+    return 1
+  fi
+  dir=$lint_root/bin/$t
+  archive=$dir.tar.gz
+  mkdir -p -- "$dir" "$lint_root/bin"
+  if ! lint_fetch "$lint_pin_url" "$archive" > /dev/null 2>&1; then
+    problem lint-tool-install "$t could not be downloaded from $lint_pin_url (offline, or GitHub unavailable), so its files were not linted. CI lints with a pinned copy and fails closed; re-run the job."
+    return 1
+  fi
+  if ! lint_sha256_ok "$archive" "$lint_pin_sha"; then
+    problem lint-tool-install "the $t download from $lint_pin_url did not match its pinned sha256 ($lint_pin_sha), so it was discarded and not run. Re-run the job; if it keeps failing the release was re-published or tampered with: review it, then bump the pin in .githooks/agent-checks's source, _agent-guidance templates/agent-checks/agent-checks."
+    rm -f -- "$archive"
+    return 1
+  fi
+  if ! tar -xzf "$archive" -C "$dir" -- "$lint_pin_member" > /dev/null 2>&1 || [ ! -f "$dir/$lint_pin_member" ]; then
+    problem lint-tool-install "the verified $t archive did not contain $lint_pin_member, so its files were not linted. Re-run the job."
+    return 1
+  fi
+  chmod +x -- "$dir/$lint_pin_member"
+  lint_installed=$dir/$lint_pin_member
+}
+
+# lint_need <tool> — find (or, in CI, install) the tool. Sets lint_bin_<tool>;
+# a tool that cannot be had gives one notice and fails.
+lint_need() {
+  local t=$1 var=lint_bin_$1 p
+  p=${!var:-}
+  [ -z "$p" ] || return 0
+  case " $lint_tried " in *" $t "*) return 1 ;; esac
+  lint_tried="$lint_tried $t"
+  p=$(command -v "$t" 2> /dev/null) || p=""
+  if [ -z "$p" ] && [ "${GITHUB_ACTIONS:-}" = true ]; then
+    case "$t" in shellcheck|actionlint|ruff) lint_install "$t" || return 1; p=$lint_installed ;; esac
+  fi
+  if [ -z "$p" ]; then
+    lint_notice_once "$t" "lint skipped: $t is not on PATH, so its files were not linted. Install it to get these checks locally; CI runs them (it installs a pinned copy of shellcheck, actionlint and ruff)."
+    return 1
+  fi
+  printf -v "$var" '%s' "$p"
+}
+
+# lint_pssa_ready — pwsh has PSScriptAnalyzer (installed pinned in CI).
+lint_pssa_ready() {
+  local probe="if (Get-Module -ListAvailable -Name PSScriptAnalyzer) { exit 0 } else { exit 3 }" cmd
+  lint_need pwsh || return 1
+  "$lint_bin_pwsh" -NoProfile -NonInteractive -Command "$probe" > /dev/null 2>&1 && return 0
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    cmd="\$ErrorActionPreference = 'Stop'; if (Get-Command Install-PSResource -ErrorAction SilentlyContinue) { Install-PSResource -Name PSScriptAnalyzer -Version '$LINT_PSSA_VERSION' -Scope CurrentUser -TrustRepository -Quiet } else { Install-Module -Name PSScriptAnalyzer -RequiredVersion '$LINT_PSSA_VERSION' -Scope CurrentUser -Force }"
+    if "$lint_bin_pwsh" -NoProfile -NonInteractive -Command "$cmd" > /dev/null 2>&1 \
+       && "$lint_bin_pwsh" -NoProfile -NonInteractive -Command "$probe" > /dev/null 2>&1; then
+      return 0
+    fi
+    problem lint-tool-install "PSScriptAnalyzer $LINT_PSSA_VERSION could not be installed with pwsh (offline, or PowerShell Gallery unavailable), so PowerShell files were not linted. CI fails closed; re-run the job."
+    return 1
+  fi
+  lint_notice_once PSScriptAnalyzer "lint skipped: the PSScriptAnalyzer module is not installed for pwsh, so PowerShell files were not linted. Install-PSResource PSScriptAnalyzer to get these checks locally; CI installs a pinned copy."
+  return 1
+}
+
+# lint_skip_path <path> — vendored, generated, fixture and fragment (partial
+# source extracted from a test) paths are not linted; a repo adds more with
+# exclude= in lint.conf.
+lint_skip_path() {
+  local g
+  case "$1" in
+    node_modules/*|*/node_modules/*|vendor/*|*/vendor/*|third_party/*|*/third_party/*) return 0 ;;
+    fixtures/*|*/fixtures/*|testdata/*|*/testdata/*|*/__snapshots__/*|fragments/*|*/fragments/*|evals/*/seed/*) return 0 ;;
+    *.min.js|*.min.mjs) return 0 ;;
+    *$'\n'*|*$'\t'*) return 0 ;;
+  esac
+  case "/$1/" in */../*) return 0 ;; esac
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    # A glob matched with case, never eval'd; its charset was checked on load.
+    # shellcheck disable=SC2254
+    case "$1" in $g) return 0 ;; esac
+  done <<< "$lint_excl"
+  return 1
+}
+
+# lint_lang_of <path> — print the language a path is linted as: shell, python,
+# workflow, powershell, javascript, ruby, or shell-maybe (an extensionless
+# file whose first line decides). Prints nothing for the rest.
+lint_lang_of() {
+  local base=${1##*/}
+  case "$1" in
+    .github/workflows/*/*) return 0 ;;
+    .github/workflows/*.yml|.github/workflows/*.yaml) echo workflow; return 0 ;;
+    .githooks/*/*) return 0 ;;
+    .githooks/*)
+      case "$base" in
+        *.sh|*.bash) echo shell ;;
+        *.*) ;;
+        *) echo shell ;;
+      esac
+      return 0 ;;
+  esac
+  case "$base" in
+    *.sh|*.bash) echo shell ;;
+    *.py) echo python ;;
+    *.ps1|*.psm1|*.psd1) echo powershell ;;
+    *.js|*.mjs|*.cjs) echo javascript ;;
+    *.rb) echo ruby ;;
+    .*|*.*) ;;
+    LICENSE|COPYING|Makefile|GNUmakefile|Dockerfile|Gemfile|Rakefile|Procfile|CODEOWNERS|README|NOTICE|AUTHORS|CHANGELOG|VERSION|Brewfile|Vagrantfile|Jenkinsfile) ;;
+    *) echo shell-maybe ;;
+  esac
+}
+
+# lint_stage <path> — copy the blob being checked into the temp tree; fail when
+# it has none, or is over 1 MiB (generated or data).
+lint_stage() {
+  local spec dest size
+  if [ "$content_rev" = index ]; then spec=":$1"; else spec="$content_rev:$1"; fi
+  git cat-file -e "$spec" 2> /dev/null || return 1
+  size=$(git cat-file -s "$spec" 2> /dev/null) || return 1
+  [ "${size:-2097152}" -le 1048576 ] || return 1
+  dest=$lint_tree/$1
+  mkdir -p -- "${dest%/*}" && git cat-file blob "$spec" > "$dest" 2> /dev/null
+}
+
+# lint_stage_cfg <path> <name>... — copy each named config file from the
+# path's own directory and every directory above it, when the content has it.
+lint_stage_cfg() {
+  local d=$1 n p
+  shift
+  while :; do
+    case "$d" in */*) d=${d%/*} ;; *) d="" ;; esac
+    for n in "$@"; do
+      p=${d:+$d/}$n
+      case $'\n'"$lint_seen" in *$'\n'"$p"$'\n'*) continue ;; esac
+      lint_seen="$lint_seen$p"$'\n'
+      lint_stage "$p" || true
+    done
+    [ -n "$d" ] || break
+  done
+}
+lint_seen=""
+
+# lint_shebang_kind <file> — sh (a sh-family shebang), none, or other.
+lint_shebang_kind() {
+  local first w
+  IFS= read -r first < "$1" || true
+  case "$first" in '#!'*) ;; *) echo none; return 0 ;; esac
+  first=${first#'#!'}
+  set -f
+  # shellcheck disable=SC2086
+  set -- $first
+  set +f
+  w=${1:-}
+  case "$w" in */env) shift; while [ "${1:-}" != "" ]; do case "$1" in -*|*=*) shift ;; *) break ;; esac; done; w=${1:-} ;; esac
+  case "${w##*/}" in bash|sh|dash|ksh|ash) echo sh ;; *) echo other ;; esac
+}
+
+# lint_ruff_has_config <path> — the nearest ruff config above a python file is
+# a ruff.toml, .ruff.toml or a pyproject.toml with a [tool.ruff] table.
+lint_ruff_has_config() {
+  local d=$1 n
+  while :; do
+    case "$d" in */*) d=${d%/*} ;; *) d="" ;; esac
+    for n in ruff.toml .ruff.toml; do
+      [ -f "$lint_tree/${d:+$d/}$n" ] && return 0
+    done
+    if [ -f "$lint_tree/${d:+$d/}pyproject.toml" ] \
+       && grep -Eq '^\[tool\.ruff[].]' "$lint_tree/${d:+$d/}pyproject.toml"; then
+      return 0
+    fi
+    [ -n "$d" ] || break
+  done
+  return 1
+}
+
+# lint_ranges <path> — append the path's changed line ranges, as
+# `path<TAB>start<TAB>end` lines, to the ranges file.
+lint_ranges() {
+  local h s c
+  while IFS= read -r h; do
+    [[ $h =~ ^@@\ -[0-9]+(,[0-9]+)?\ \+([0-9]+)(,([0-9]+))?\ @@ ]] || continue
+    s=${BASH_REMATCH[2]}
+    c=${BASH_REMATCH[4]:-1}
+    [ "$c" -gt 0 ] || continue
+    printf '%s\t%s\t%s\n' "$1" "$s" $((s + c - 1))
+  done < <(git diff -U0 --no-color --no-ext-diff --no-textconv ${lint_diff[@]+"${lint_diff[@]}"} -- ":(literal)$1" 2> /dev/null | grep '^@@') >> "$lint_meta/ranges"
+}
+
+# lint_filter <changed|all> — read findings (`path<TAB>line<TAB>text`) on stdin;
+# print those on changed lines (all, in tree mode), at most lint_cap per file,
+# then one `path<TAB>0<TAB>N more...` line for the rest.
+lint_filter() {
+  awk -F'\t' -v mode="$1" -v rfile="$lint_meta/ranges" -v cap="$lint_cap" '
+    BEGIN {
+      if (mode == "changed") {
+        while ((getline l < rfile) > 0) {
+          split(l, a, "\t"); n = ++cnt[a[1]]; s[a[1], n] = a[2] + 0; e[a[1], n] = a[3] + 0
+        }
+      }
+    }
+    {
+      if (mode == "changed") {
+        ok = 0
+        for (i = 1; i <= cnt[$1]; i++) if (($2 + 0) >= s[$1, i] && ($2 + 0) <= e[$1, i]) { ok = 1; break }
+        if (!ok) next
+      }
+      if (++seen[$1] <= cap) print; else more[$1]++
+    }
+    END { for (p in more) printf "%s\t0\t%d more findings in this file are not shown\n", p, more[p] }
+  '
+}
+
+# lint_norm_gcc <file> — `path:line:col: text` lines as `path<TAB>line<TAB>text`.
+lint_norm_gcc() {
+  local line t re='^(.*):([0-9]+):([0-9]+): (.*)$'
+  while IFS= read -r line; do
+    [[ $line =~ $re ]] || continue
+    t=${BASH_REMATCH[4]//$'\t'/ }
+    printf '%s\t%s\t%s\n' "${BASH_REMATCH[1]#./}" "${BASH_REMATCH[2]}" "${t:0:300}"
+  done < <(LC_ALL=C tr -d '\000-\010\013-\037\177' < "$1")
+}
+
+# lint_refuse <language> <message> — refuse under the language's check id (each
+# id is a literal, so the run log and the id check can read it).
+lint_refuse() {
+  case "$1" in
+    shell) problem lint-required-shell "$2" ;;
+    python) problem lint-required-python "$2" ;;
+    workflow) problem lint-required-workflow "$2" ;;
+    powershell) problem lint-required-powershell "$2" ;;
+    javascript) problem lint-required-javascript "$2" ;;
+    ruby) problem lint-required-ruby "$2" ;;
+  esac
+}
+
+# lint_report <language> <tool> <hint> <required-file> <advisory-file> — emit
+# the two tiers' normalized findings.
+lint_report() {
+  local lang=$1 tool=$2 hint=$3 path line text
+  if lint_on "$lang" required; then
+    note_ran "lint-required-$lang"
+    while IFS=$'\t' read -r path line text; do
+      [ -n "$path" ] || continue
+      text=${text%.}
+      if [ "$line" = 0 ]; then
+        lint_refuse "$lang" "$path: $text. $hint"
+      else
+        lint_refuse "$lang" "$path:$line: $tool: $text. $hint"
+      fi
+    done < <(lint_filter all < "$4")
+  fi
+  if lint_on "$lang" advisory; then
+    while IFS=$'\t' read -r path line text; do
+      [ -n "$path" ] || continue
+      text=${text%.}
+      if [ "$line" = 0 ]; then
+        lint_warn "$path: $text."
+      elif [ "${GITHUB_ACTIONS:-}" = true ]; then
+        printf '::warning file=%s,line=%s,title=agent-checks lint %s::%s\n' \
+          "$(lint_gh_prop "$path")" "$line" "$tool" "$(lint_gh_data "$text")" >&2
+      else
+        printf 'agent-checks (warning): %s:%s: %s: %s\n' "$path" "$line" "$tool" "$text" >&2
+      fi
+    done < <(lint_filter "$lint_mode" < "$5")
+  fi
+}
+
+# lint_chunks <list> <out> <command...> — run the command over the list's files
+# (NUL-separated, relative to the temp tree), 100 at a time, after `--`; append
+# stdout to <out>; set lint_rc to the highest exit status.
+lint_chunks() {
+  local list=$1 out=$2 f r
+  local -a chunk=()
+  shift 2
+  lint_rc=0
+  : > "$out"
+  while IFS= read -r -d '' f; do
+    chunk[${#chunk[@]}]=$f
+    if [ "${#chunk[@]}" -ge 100 ]; then
+      r=0
+      (cd "$lint_tree" && "$@" -- "${chunk[@]}") >> "$out" 2> /dev/null || r=$?
+      [ "$r" -le "$lint_rc" ] || lint_rc=$r
+      chunk=()
+    fi
+  done < "$list"
+  if [ "${#chunk[@]}" -gt 0 ]; then
+    r=0
+    (cd "$lint_tree" && "$@" -- "${chunk[@]}") >> "$out" 2> /dev/null || r=$?
+    [ "$r" -le "$lint_rc" ] || lint_rc=$r
+  fi
+}
+
+# lint_split_sev <norm> <required-out> <advisory-out> — shellcheck-style text
+# `error: ...` goes to the required file (prefix dropped), the rest to advisory.
+lint_split_sev() {
+  awk -F'\t' -v OFS='\t' -v req="$2" -v adv="$3" '
+    $3 ~ /^error: / { sub(/^error: /, "", $3); print > req; next }
+    { print > adv }
+  ' "$1"
+  [ -f "$2" ] || : > "$2"
+  [ -f "$3" ] || : > "$3"
+}
+
+lint_run_shell() {
+  local kind list out="$lint_meta/sh.out" norm="$lint_meta/sh.norm"
+  : > "$norm"
+  lint_need shellcheck || return 0
+  for kind in shell shell-bash; do
+    list=$lint_meta/lists/$kind
+    [ -s "$list" ] || continue
+    if [ "$kind" = shell-bash ]; then
+      lint_chunks "$list" "$out" "$lint_bin_shellcheck" -f gcc --severity=style -e SC1090,SC1091 -s bash
+    else
+      lint_chunks "$list" "$out" "$lint_bin_shellcheck" -f gcc --severity=style -e SC1090,SC1091
+    fi
+    if [ "$lint_rc" -ge 3 ]; then
+      lint_warn "lint: shellcheck stopped with exit $lint_rc, so some shell files were not linted."
+    fi
+    lint_norm_gcc "$out" >> "$norm"
+  done
+  lint_split_sev "$norm" "$lint_meta/sh.req" "$lint_meta/sh.adv"
+  lint_report shell shellcheck "Fix it, or for a false positive add '# shellcheck disable=SCnnnn' with the reason. Check with: shellcheck <file>" "$lint_meta/sh.req" "$lint_meta/sh.adv"
+}
+
+lint_ruff_codes_required() {   # stdin: normalized; stdout: those NOT in the required set
+  awk -F'\t' '$3 !~ /^(E9|F63|F7|F82|invalid-syntax)/'
+}
+
+lint_run_python() {
+  local out="$lint_meta/py.out" req="$lint_meta/py.req" adv="$lint_meta/py.adv" all="$lint_meta/lists/python" cfg="$lint_meta/lists/python-cfg"
+  lint_need ruff || return 0
+  # The required run applies to every python file; --select on the command
+  # line replaces the repo's own selection, and --force-exclude keeps its
+  # exclude list.
+  cat "$lint_meta/lists/python" "$lint_meta/lists/python-cfg" > "$lint_meta/py.all" 2> /dev/null
+  lint_chunks "$lint_meta/py.all" "$out" "$lint_bin_ruff" check --no-cache --force-exclude --select E9,F63,F7,F82 --output-format=concise
+  if [ "$lint_rc" -ge 2 ]; then
+    lint_warn "lint: ruff stopped with exit $lint_rc (a bad ruff config in the repo?), so Python files were not linted."
+    : > "$req"; : > "$adv"
+    return 0
+  fi
+  lint_norm_gcc_ruff "$out" > "$req"
+  : > "$adv"
+  if lint_on python advisory; then
+    if [ -s "$all" ]; then
+      lint_chunks "$all" "$out" "$lint_bin_ruff" check --no-cache --force-exclude --output-format=concise \
+        --select F,B,PLE,PLW,W605,E711,E712,E713,E714,E721,E722,E9 --ignore B905,PLW0603,PLW2901
+      [ "$lint_rc" -lt 2 ] && lint_norm_gcc_ruff "$out" | lint_ruff_codes_required >> "$adv"
+    fi
+    if [ -s "$cfg" ]; then
+      lint_chunks "$cfg" "$out" "$lint_bin_ruff" check --no-cache --force-exclude --output-format=concise
+      [ "$lint_rc" -lt 2 ] && lint_norm_gcc_ruff "$out" | lint_ruff_codes_required >> "$adv"
+    fi
+  fi
+  lint_report python ruff "Fix it, or ignore a false positive with '# noqa: <code>' and the reason. Check with: ruff check --select E9,F63,F7,F82 <file>" "$req" "$adv"
+}
+
+# lint_norm_gcc_ruff <file> — ruff's concise lines; its trailer lines never match.
+lint_norm_gcc_ruff() { lint_norm_gcc "$1"; }
+
+lint_run_workflow() {
+  local list=$lint_meta/lists/workflow out="$lint_meta/al.out" req="$lint_meta/al.req" adv="$lint_meta/al.adv" sc=""
+  lint_need actionlint || return 0
+  lint_chunks "$list" "$out" "$lint_bin_actionlint" -oneline -shellcheck= -pyflakes=
+  if [ "$lint_rc" -ge 2 ]; then
+    lint_warn "lint: actionlint stopped with exit $lint_rc, so workflow files were not linted."
+    return 0
+  fi
+  lint_norm_gcc "$out" > "$lint_meta/al.all"
+  # A runner label the repo's own runners define is not knowable here: advisory.
+  grep -v '\[runner-label\]$' "$lint_meta/al.all" > "$req" || true
+  : > "$adv"
+  grep '\[runner-label\]$' "$lint_meta/al.all" >> "$adv" || true
+  if lint_on workflow advisory; then
+    sc=$(command -v shellcheck 2> /dev/null) || sc=${lint_bin_shellcheck:-}
+    if [ -n "$sc" ]; then
+      lint_chunks "$list" "$out" "$lint_bin_actionlint" -oneline -shellcheck "$sc" -pyflakes=
+      if [ "$lint_rc" -lt 2 ]; then
+        lint_norm_gcc "$out" | grep -vxFf "$lint_meta/al.all" >> "$adv" || true
+      fi
+    fi
+  fi
+  lint_report workflow actionlint "Fix it; actionlint's checks are documented at https://github.com/rhysd/actionlint/blob/main/docs/checks.md. Check with: actionlint <file>" "$req" "$adv"
+}
+
+lint_run_powershell() {
+  local list=$lint_meta/lists/powershell script="$lint_meta/pssa.ps1" out="$lint_meta/ps.out" norm="$lint_meta/ps.norm" settings="" rc=0
+  lint_pssa_ready || return 0
+  [ -f "$lint_tree/PSScriptAnalyzerSettings.psd1" ] && settings=./PSScriptAnalyzerSettings.psd1
+  cat > "$script" <<'PS'
+param([string]$List, [string]$Settings)
+$ErrorActionPreference = 'Stop'
+Import-Module PSScriptAnalyzer
+foreach ($f in Get-Content -LiteralPath $List) {
+  $p = @{ Path = $f; Severity = @('Error', 'ParseError', 'Warning') }
+  if ($Settings) { $p.Settings = $Settings }
+  foreach ($r in @(Invoke-ScriptAnalyzer @p)) {
+    '{0}:{1}:{2}: {3}: {4}: {5}' -f $f, $r.Line, $r.Column, $r.Severity, $r.RuleName, ($r.Message -replace '\s+', ' ')
+  }
+}
+PS
+  tr '\0' '\n' < "$list" > "$lint_meta/ps.list"
+  (cd "$lint_tree" && "$lint_bin_pwsh" -NoProfile -NonInteractive -File "$script" -List "$lint_meta/ps.list" -Settings "$settings") > "$out" 2> /dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    lint_warn "lint: PSScriptAnalyzer stopped with exit $rc, so some PowerShell files were not linted."
+  fi
+  lint_norm_gcc "$out" > "$norm"
+  # Error and ParseError refuse; Warning is advisory.
+  awk -F'\t' -v OFS='\t' -v req="$lint_meta/ps.req" -v adv="$lint_meta/ps.adv" '
+    $3 ~ /^(Error|ParseError): / { sub(/^[A-Za-z]+: /, "", $3); print > req; next }
+    $3 ~ /^Warning: / { sub(/^Warning: /, "", $3); print > adv }
+  ' "$norm"
+  [ -f "$lint_meta/ps.req" ] || : > "$lint_meta/ps.req"
+  [ -f "$lint_meta/ps.adv" ] || : > "$lint_meta/ps.adv"
+  lint_report powershell PSScriptAnalyzer "Fix it, or suppress a false positive with [Diagnostics.CodeAnalysis.SuppressMessageAttribute()] and the reason. Check with: Invoke-ScriptAnalyzer -Severity Error <file>" "$lint_meta/ps.req" "$lint_meta/ps.adv"
+}
+
+# lint_run_syntax <language> <tool> <list> — a syntax-only check, one file at a
+# time: node --check, or ruby -wc. A nonzero exit is the finding.
+lint_run_syntax() {
+  local lang=$1 tool=$2 list=$3 f err msg line rc req="$lint_meta/$1.req"
+  : > "$req"
+  while IFS= read -r -d '' f; do
+    rc=0
+    if [ "$lang" = javascript ]; then
+      err=$(cd "$lint_tree" && "$lint_bin_node" --check "./$f" 2>&1 > /dev/null) || rc=$?
+      msg=$(printf '%s\n' "$err" | grep -m1 -E '^[A-Za-z]*Error')
+    else
+      err=$(cd "$lint_tree" && "$lint_bin_ruby" -wc "./$f" 2>&1 > /dev/null) || rc=$?
+      msg=$(printf '%s\n' "$err" | grep -m1 -E 'rror')
+    fi
+    [ "$rc" -ne 0 ] || continue
+    line=$(printf '%s\n' "$err" | sed -n 's/^[^[:space:]]*:\([0-9][0-9]*\)\(:.*\)\{0,1\}$/\1/p' | head -n 1)
+    [ -n "$line" ] || line=1
+    [ -n "$msg" ] || msg="syntax check failed (exit $rc)"
+    msg=$(printf '%s' "$msg" | LC_ALL=C tr -d '\000-\037\177')
+    printf '%s\t%s\t%s\n' "$f" "$line" "${msg:0:300}" >> "$req"
+  done < "$list"
+  : > "$lint_meta/$lang.adv"
+  lint_report "$lang" "$tool" "Fix the syntax error. Check with: $4" "$req" "$lint_meta/$lang.adv"
+}
+
+# run_lint <list> — the lint pass over a NUL-separated path list.
+run_lint() {
+  local list=$1 path lang kind syms="" any=false l first
+  [ "${AGENT_CHECKS_LINT:-}" = off ] && return 0
+  lint_conf_load
+  lint_root=$(mktemp -d) || { lint_warn "lint skipped: could not create a temp directory."; return 0; }
+  lint_tree=$lint_root/tree
+  lint_meta=$lint_root/meta
+  mkdir -p "$lint_tree" "$lint_meta/lists" "$lint_root/bin"
+  : > "$lint_meta/ranges"
+  lint_seen=""
+  lint_tried=""
+  lint_bin_shellcheck="" lint_bin_ruff="" lint_bin_actionlint="" lint_bin_pwsh="" lint_bin_node="" lint_bin_ruby=""
+  for l in shell shell-bash python python-cfg workflow powershell javascript ruby; do : > "$lint_meta/lists/$l"; done
+  while IFS= read -r -d '' path; do
+    [ -n "$path" ] || continue
+    lang=$(lint_lang_of "$path")
+    [ -n "$lang" ] || continue
+    lint_skip_path "$path" && continue
+    case "$lang" in shell-maybe) l=shell ;; *) l=$lang ;; esac
+    lint_on "$l" required || lint_on "$l" advisory || continue
+    if [ -z "$syms" ]; then
+      syms=$lint_meta/symlinks
+      if [ "$content_rev" = index ]; then git ls-files -s -z; else git ls-tree -r -z "$content_rev"; fi 2> /dev/null \
+        | tr '\0' '\n' | awk -F'\t' '{ split($1, a, " "); if (a[1] == "120000") print $2 }' > "$syms"
+    fi
+    grep -qxF -- "$path" "$syms" && continue
+    lint_stage "$path" || continue
+    kind=$lang
+    case "$lang" in
+      shell|shell-maybe)
+        case "$(lint_shebang_kind "$lint_tree/$path")" in
+          sh) kind=shell ;;
+          none) if [ "$lang" = shell-maybe ]; then continue; else kind=shell-bash; fi ;;
+          *) continue ;;
+        esac
+        lint_stage_cfg "$path" .shellcheckrc ;;
+      python)
+        lint_stage_cfg "$path" ruff.toml .ruff.toml pyproject.toml
+        if lint_ruff_has_config "$path"; then kind=python-cfg; fi ;;
+      workflow) lint_stage_cfg "$path" .github/actionlint.yaml .github/actionlint.yml ;;
+      powershell) lint_stage_cfg "$path" PSScriptAnalyzerSettings.psd1 ;;
+      javascript)
+        # A Jekyll page with front matter is not JavaScript yet.
+        IFS= read -r first < "$lint_tree/$path" || true
+        [ "${first:-}" = "---" ] && continue
+        lint_stage_cfg "$path" package.json ;;
+    esac
+    printf '%s\0' "$path" >> "$lint_meta/lists/$kind"
+    any=true
+    [ "$lint_mode" = changed ] && lint_ranges "$path"
+  done < "$list"
+  if $any; then
+    [ -s "$lint_meta/lists/shell" ] || [ -s "$lint_meta/lists/shell-bash" ] && lint_run_shell
+    [ -s "$lint_meta/lists/python" ] || [ -s "$lint_meta/lists/python-cfg" ] && lint_run_python
+    [ -s "$lint_meta/lists/workflow" ] && lint_run_workflow
+    [ -s "$lint_meta/lists/powershell" ] && lint_run_powershell
+    if [ -s "$lint_meta/lists/javascript" ] && lint_need node; then
+      lint_run_syntax javascript "node --check" "$lint_meta/lists/javascript" "node --check <file>"
+    fi
+    if [ -s "$lint_meta/lists/ruby" ] && lint_need ruby; then
+      lint_run_syntax ruby "ruby -wc" "$lint_meta/lists/ruby" "ruby -wc <file>"
+    fi
+  fi
+  rm -rf "$lint_root"
+  return 0
+}
+
+# run_checks — the fleet checks, then the repo's own, over the same
+# NUL-separated path list on stdin, then the warning pass.
+run_checks() {
+  local list id
+  note_ran secret-file
+  note_ran skill-shell
+  for id in $lesson_checks; do note_ran "$id"; done
+  local_identity_init
+  list=$(mktemp) || { problem runner-error "could not create a temp file, so nothing was checked."; return; }
+  cat > "$list"
+  check_paths < "$list"
+  check_gha_injection "$list"
+  run_local_checks < "$list"
+  run_lint "$list"
+  run_dated_phrasing "$list"
+  rm -f "$list"
+}
+
+# Paths added or changed by any commit in a range, so a file added and then
+# deleted inside the range is still caught: it stays in the history.
+paths_in_range() {
+  git log --format= --name-only -z --diff-filter=ACMR "$@"
+}
+
+# git writes an all-zero object id for "no commit" (a new branch, a delete),
+# 40 digits under SHA-1 and 64 under SHA-256.
+is_zero() {
+  case "$1" in
+    ''|*[!0]*) return 1 ;;
+  esac
+}
+
+# lint_set_range <base> <head> — the diff the lint pass reads changed lines
+# from: base...head when base is a commit this clone has, else head against its
+# parent (or the empty tree for a root commit).
+lint_set_range() {
+  local parent
+  if known_commit "$1"; then
+    lint_diff=("$1...$2")
+  elif parent=$(git rev-parse --verify --quiet "$2^" 2> /dev/null); then
+    lint_diff=("$parent" "$2")
+  else
+    lint_diff=("$(git hash-object -t tree /dev/null)" "$2")
+  fi
+}
+
+# Usable as a range base: a real commit this clone has.
+known_commit() {
+  [ -n "$1" ] && ! is_zero "$1" && git cat-file -e "$1^{commit}" 2>/dev/null
+}
+
+event=${1:-}
+case "$event" in
+  pre-commit)
+    content_rev=index
+    lint_diff=(--cached)
+    run_checks < <(git diff --cached --name-only -z --diff-filter=ACMR)
+    ;;
+
+  pre-push)
+    remote=${2:-origin}
+    while read -r _ local_oid remote_ref remote_oid; do
+      [ -n "${remote_ref:-}" ] || continue
+      # A delete pushes no content to check.
+      is_zero "$local_oid" && continue
+      privacy_push_ref "$remote" "$remote_ref" "$local_oid" "$remote_oid"
+      content_rev=$local_oid
+      if known_commit "$remote_oid"; then
+        lint_set_range "$remote_oid" "$local_oid"
+        run_checks < <(paths_in_range "$remote_oid..$local_oid")
+      else
+        # A new branch: its changed lines start at the parent of its oldest
+        # commit that no remote has.
+        oldest=$(git rev-list "$local_oid" --not --remotes="$remote" 2> /dev/null | tail -n 1)
+        lint_set_range "${oldest:+$oldest^}" "$local_oid"
+        run_checks < <(paths_in_range "$local_oid" --not --remotes="$remote")
+      fi
+    done
+    ;;
+
+  ci)
+    base=${2:-}
+    head=${3:-HEAD}
+    content_rev=$head
+    lint_set_range "$base" "$head"
+    if known_commit "$base"; then
+      run_checks < <(paths_in_range "$base..$head")
+    else
+      run_checks < <(paths_in_range -1 "$head")
+    fi
+    run_pr_tldr
+    run_privacy_ci "$base" "$head"
+    ;;
+
+  tree)
+    rev=${2:-HEAD}
+    if ! git rev-parse --verify --quiet "$rev^{tree}" > /dev/null; then
+      problem tree-rev "tree: '$rev' is not a commit or tree in this repository, so nothing was checked. Name a revision that exists (git rev-parse --verify '$rev')."
+    else
+      content_rev=$rev
+      lint_mode=all
+      run_checks < <(git ls-tree -r -z --name-only "$rev")
+    fi
+    ;;
+
+  *)
+    exit 0
+    ;;
+esac
+
+# ── Run log ──────────────────────────────────────────────────────────────────
+# json_ids <ids> — a JSON array of space-separated kebab-case ids.
+json_ids() {
+  local id out=""
+  for id in $1; do out="$out${out:+,}\"$id\""; done
+  printf '[%s]' "$out"
+}
+
+# origin_repo — origin's GitHub "owner/name" as a JSON string, or null.
+origin_repo() {
+  local url rest owner name ok=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-
+  url=$(git remote get-url origin 2>/dev/null) || url=""
+  case "$url" in
+    https://github.com/*) rest=${url#https://github.com/} ;;
+    git@github.com:*) rest=${url#git@github.com:} ;;
+    ssh://git@github.com/*) rest=${url#ssh://git@github.com/} ;;
+    *) rest="" ;;
+  esac
+  rest=${rest%.git}
+  owner=${rest%%/*}
+  name=${rest#*/}
+  case "$owner" in ''|*[!$ok]*) printf null; return ;; esac
+  case "$name" in ''|*[!$ok]*) printf null; return ;; esac
+  printf '"%s/%s"' "$owner" "$name"
+}
+
+# runner_digest — this file's sha256, first 12 hex digits, as a JSON string,
+# or null when no hash tool answers.
+runner_digest() {
+  local self=${BASH_SOURCE[0]} sum
+  sum=$( { sha256sum -- "$self" || shasum -a 256 -- "$self"; } 2>/dev/null) || sum=""
+  sum=${sum%% *}
+  sum=${sum:0:12}
+  case "$sum" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) printf '"%s"' "$sum" ;;
+    *) printf null ;;
+  esac
+}
+
+log_run() {
+  local log=${AGENT_CHECKS_LOG:-} base ts line
+  [ "$log" = off ] && return 0
+  if [ -z "$log" ]; then
+    base=${XDG_STATE_HOME:-}
+    [ -n "$base" ] || { [ -n "${HOME:-}" ] && base=$HOME/.local/state; } || return 0
+    log=$base/agent-checks/runs.jsonl
+  fi
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || return 0
+  line=$(printf '{"v":1,"ts":"%s","event":"%s","repo":%s,"checks":%s,"failed":%s,"runner":%s}' \
+    "$ts" "$event" "$(origin_repo)" "$(json_ids "$ran_ids")" "$(json_ids "$failed_ids")" "$(runner_digest)")
+  (
+    mkdir -p -- "$(dirname -- "$log")" || exit 0
+    { [ ! -e "$log" ] || [ -f "$log" ]; } || exit 0
+    printf '%s\n' "$line" >> "$log"
+  ) > /dev/null 2>&1 || true
+}
+
+case "$event" in
+  pre-commit|pre-push) log_run ;;
+esac
+
+if [ "$failed" -ne 0 ]; then
+  printf '%s\n' "agent-checks: fix the cause rather than skipping the hook (--no-verify); CI runs the same checks. If a check is wrong, say so to the owner." >&2
+  exit 1
+fi
+exit 0

@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Publish the daily usage census from inside WSL.
+#
+# Run by the 'Usage Census Publish' scheduled task, which calls wsl.exe directly
+# (no pwsh in between) with this script as the entry point. Arguments are passed
+# through to skills-evals' scripts/publish_usage_census.sh, so --dry-run works.
+#
+# It shallow-clones skills-evals `main` and runs that copy instead of a local
+# checkout: the owner's local skills-evals checkout sits on arbitrary feature
+# branches, and the scheduled run must always execute the reviewed main version.
+#
+# One line per run is appended to the log (UTC timestamp, exit code, output
+# collapsed onto one line). The publish script's output is totals only; nothing
+# is added to it here, so no path or personal data reaches the log or stdout.
+#
+# Required setting, with no default: SKILLS_EVALS_URL, the repository to clone.
+# Set it in ~/.config/wsl-automation/settings.env or the environment (see
+# task-settings.sh and config/settings.env.example); when it is missing the run
+# logs a line naming it and exits 2.
+#
+# After a publish that pushed a changed census, it dispatches skills-evals'
+# explorer-data.yml on main (`gh workflow run`), so the Evals Explorer and the
+# dashboard rebuild from the new census the same day instead of at the
+# workflow's next 09:41 UTC cron. "Pushed a changed census" is the publisher's
+# summary line carrying the public note `; published;` (skills-evals
+# scripts/publish_usage_census.sh sets public_note="published" only after a
+# verified push; unchanged and --dry-run runs print other notes). The dispatch
+# runs inside the clone, so gh resolves the repository from its origin. A
+# failed or timed-out dispatch does not undo the push: it adds
+# one status phrase to the log line and makes the exit code 5 (unless the
+# publisher already failed, whose code is kept), so the task's last result shows it.
+#
+# Environment seams (for tests):
+#   USAGE_CENSUS_LOG   log file (default: ~/.cache/usage-census.log)
+set -euo pipefail
+
+# Update the checkout from main and re-exec this entry first; see
+# update-task-checkout.sh. A daily run always tries (interval 0).
+scripts_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/update-task-checkout.sh
+. "$scripts_dir/update-task-checkout.sh"
+wsl_automation_task_bootstrap "$scripts_dir/publish-usage-census.sh" 0 300 "$@"
+# shellcheck source=scripts/task-settings.sh
+. "$scripts_dir/task-settings.sh"
+
+log=${USAGE_CENSUS_LOG:-$HOME/.cache/usage-census.log}
+mkdir -p -- "$(dirname -- "$log")"
+
+if ! wsl_automation_require_setting SKILLS_EVALS_URL; then
+    out='usage census: setting SKILLS_EVALS_URL is missing or invalid'
+    printf '%s exit=2 %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$out" >>"$log"
+    printf '%s\n' "$out"
+    exit 2
+fi
+# SKILLS_EVALS_URL=none: no skills-evals (the kit's base track), so the
+# census has nowhere to publish; skip, logged, and exit 0.
+if [[ $SKILLS_EVALS_URL == none ]]; then
+    out='usage census: skipped: SKILLS_EVALS_URL is none, so there is no skills-evals to publish to'
+    printf '%s exit=0 %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$out" >>"$log"
+    printf '%s\n' "$out"
+    exit 0
+fi
+url=$SKILLS_EVALS_URL
+
+# The explorer dispatch needs the GitHub CLI; say so before any work instead of
+# ending as "failed (gh exit 127)" after the publish.
+if ! command -v gh >/dev/null 2>&1; then
+    out='usage census: the GitHub CLI (gh) is not installed; install it from https://cli.github.com and sign in with gh auth login'
+    printf '%s exit=1 %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$out" >>"$log"
+    printf '%s\n' "$out"
+    exit 1
+fi
+
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT
+
+rc=0
+if git clone --quiet --depth 1 -- "$url" "$tmp/skills-evals" >/dev/null 2>&1; then
+    out=$(bash "$tmp/skills-evals/scripts/publish_usage_census.sh" "$@" 2>&1) || rc=$?
+else
+    out='usage census: could not clone skills-evals'
+    rc=1
+fi
+
+# Rebuild the explorer data after a real publish (see the header).
+if [[ $out == *'; published;'* ]]; then
+    # Run inside the clone: gh resolves the repository from its origin, and
+    # the workflow only runs on the default branch, so no --ref.
+    if (cd "$tmp/skills-evals" && timeout --kill-after=5s 60s gh workflow run explorer-data.yml >/dev/null 2>&1); then
+        status='requested'
+    else
+        status="failed (gh exit $?)"
+    fi
+    out+=$'\n'"explorer dispatch: $status"
+    if [[ $status == failed* && $rc == 0 ]]; then rc=5; fi
+fi
+
+# Collapse newlines (dropping a trailing one) so each run is exactly one log line.
+one_line=${out//$'\n'/ | }
+printf '%s exit=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" "$one_line" >>"$log"
+printf '%s\n' "$out"
+exit "$rc"
