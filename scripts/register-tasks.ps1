@@ -1,0 +1,232 @@
+#requires -Version 7.6
+#requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Wrapper script for Set-WslAutomationScheduledTasks; installs or updates the ccstatusline
+    config sync, WSL memory log, Codex Cloud environment sync, usage census publish, session
+    miner, memory curation and waiting feed publish scheduled tasks, and the Docker Desktop WSL
+    integration watchdog.
+
+.DESCRIPTION
+    Thin wrapper that imports the WslAutomation module and calls
+    Set-WslAutomationScheduledTasks with the given parameters. Must be run from an elevated
+    (Administrator) PowerShell session. Supports -WhatIf, which is passed straight through to
+    Set-WslAutomationScheduledTasks so nothing is actually registered, updated, or renamed
+    during a dry run.
+
+.PARAMETER ScriptsDir
+    Directory containing sync-ccstatusline-config.ps1, log-wsl-memory.ps1,
+    sync-codex-cloud-environments.ps1, ensure-docker-wsl-integration.ps1,
+    publish-usage-census.sh, run-session-miner.sh, run-memory-curation.sh and
+    publish-waiting-feed.sh. Defaults to the directory this script lives in.
+
+.PARAMETER DistroName
+    Name of the WSL distro the tasks run in. Defaults to 'Ubuntu'.
+
+.PARAMETER CcstatuslineTaskName
+    Name of the scheduled task that syncs the ccstatusline config from WSL. Defaults to
+    'ccstatusline Config Sync'.
+
+.PARAMETER CcstatuslineIntervalMinutes
+    How often, in minutes, the ccstatusline config sync task repeats indefinitely. Defaults to 5.
+
+.PARAMETER MemoryLogTaskName
+    Name of the scheduled task that logs WSL and Windows memory statistics. Defaults to
+    'WSL Memory Log'.
+
+.PARAMETER MemoryLogIntervalMinutes
+    How often, in minutes, the memory log task repeats indefinitely. Defaults to 5.
+
+.PARAMETER MemoryLogDir
+    Directory the memory log task writes samples.csv to. Defaults to
+    %LOCALAPPDATA%\WslMemoryLog.
+
+.PARAMETER CodexCloudEnvironmentSyncTaskName
+    Name of the scheduled task that reconciles Codex Cloud environments at midnight and noon.
+    Defaults to 'Codex Cloud Environment Sync'.
+
+.PARAMETER EnableCodexTasks
+    Enables the Codex Cloud environment sync task. Off by default: it is still registered or
+    updated, then disabled. With this switch it is enabled (even if currently disabled).
+    Re-running without it disables it again.
+
+.PARAMETER UsageCensusTaskName
+    Name of the scheduled task that publishes the daily usage census from WSL. Defaults to
+    'Usage Census Publish'.
+
+.PARAMETER UsageCensusTime
+    Time of day (HH:mm) the usage census task's daily trigger fires. Defaults to '12:37'.
+
+.PARAMETER SessionMinerTaskName
+    Name of the scheduled task that runs the daily session miner from WSL. Defaults to
+    'Session Miner'.
+
+.PARAMETER SessionMinerTime
+    Time of day (HH:mm) the session miner task's daily trigger fires. Defaults to '07:17'.
+
+.PARAMETER MemoryCurationTaskName
+    Name of the scheduled task that runs the weekly memory curation from WSL. Defaults to
+    'Memory Curation'.
+
+.PARAMETER MemoryCurationTime
+    Time of day (HH:mm) the memory curation task's weekly (Monday) trigger fires. Defaults to
+    '13:47'.
+
+.PARAMETER DockerWatchdogTaskName
+    Name of the scheduled task that runs the Docker Desktop WSL integration watchdog. Defaults to
+    'Docker WSL Integration Watchdog'.
+
+.PARAMETER DockerWatchdogIntervalMinutes
+    How often, in minutes, the watchdog task repeats indefinitely. Defaults to 30.
+
+.PARAMETER DockerWatchdogLogonDelayMinutes
+    Delay, in minutes, after logon before the watchdog's at-logon trigger fires. Defaults to 12.
+
+.PARAMETER WaitingFeedTaskName
+    Name of the scheduled task that publishes the waiting feed every minute. Defaults to
+    'Claude Waiting Feed Publish'.
+
+.PARAMETER WslExePath
+    Path to wsl.exe used as the usage census, session miner, memory curation and waiting feed
+    tasks' action. Defaults to %SystemRoot%\System32\wsl.exe.
+
+.PARAMETER ConhostPath
+    Path to conhost.exe used as the watchdog task's action executable (with --headless, so its
+    interactive run shows no console window). Defaults to %SystemRoot%\System32\conhost.exe.
+
+.PARAMETER PwshPath
+    Path to pwsh.exe used as the action executable for the pwsh-based tasks. Defaults to an MSI
+    install of PowerShell 7 (C:\Program Files\PowerShell\7\pwsh.exe) when present - required for
+    the S4U background ccstatusline, memory log and Codex Cloud tasks, which run in session 0
+    where a Store-packaged pwsh cannot launch - then the per-user WindowsApps alias, then the
+    pwsh.exe found on PATH.
+
+.PARAMETER LegacyScriptsToArchive
+    Paths to legacy scripts that should be renamed out of the way because this module
+    supersedes them. Workaround included for invocation via `pwsh -File ... -LegacyScriptsToArchive
+    "C:\a.ps1","C:\b.ps1"` from another shell (notably Windows PowerShell 5.1): -File mode
+    never re-parses commas, so the two paths can arrive flattened into one literal string
+    "C:\a.ps1,C:\b.ps1". Any element that is a comma-joined list of rooted Windows paths (each
+    looking like `C:\...` or `\\server\share\...`) is automatically expanded back into separate
+    paths before archiving.
+
+.PARAMETER SkipTaskHistory
+    Skips enabling the Microsoft-Windows-TaskScheduler/Operational event log (the "History" tab
+    in Task Scheduler), which this installer otherwise enables once per run if it is currently
+    disabled. A failure to enable it only warns; it never aborts task registration. See
+    README.md's "Task history" section for what the log records and how to read it.
+
+.EXAMPLE
+    ./register-tasks.ps1
+
+    Registers (or updates) all the scheduled tasks from an elevated prompt, using default names,
+    times, and intervals. The Codex Cloud environment sync is left disabled; add
+    -EnableCodexTasks to enable it.
+
+.EXAMPLE
+    ./register-tasks.ps1 -WhatIf
+
+    Shows what would change without actually registering, updating, or renaming anything.
+#>
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [string]$ScriptsDir = $PSScriptRoot,
+
+    [string]$DistroName = 'Ubuntu',
+
+    [string]$CcstatuslineTaskName = 'ccstatusline Config Sync',
+
+    [int]$CcstatuslineIntervalMinutes = 5,
+
+    [string]$MemoryLogTaskName = 'WSL Memory Log',
+
+    [int]$MemoryLogIntervalMinutes = 5,
+
+    [string]$MemoryLogDir = (Join-Path $env:LOCALAPPDATA 'WslMemoryLog'),
+
+    [string]$CodexCloudEnvironmentSyncTaskName = 'Codex Cloud Environment Sync',
+
+    [switch]$EnableCodexTasks,
+
+    [string]$UsageCensusTaskName = 'Usage Census Publish',
+
+    [string]$UsageCensusTime = '12:37',
+
+    [string]$SessionMinerTaskName = 'Session Miner',
+
+    [string]$SessionMinerTime = '07:17',
+
+    [string]$MemoryCurationTaskName = 'Memory Curation',
+
+    [string]$MemoryCurationTime = '13:47',
+
+    [string]$WaitingFeedTaskName = 'Claude Waiting Feed Publish',
+
+    [string]$DockerWatchdogTaskName = 'Docker WSL Integration Watchdog',
+
+    [int]$DockerWatchdogIntervalMinutes = 30,
+
+    [int]$DockerWatchdogLogonDelayMinutes = 12,
+
+    [string]$WslExePath = (Join-Path $env:SystemRoot 'System32\wsl.exe'),
+
+    [string]$ConhostPath = (Join-Path $env:SystemRoot 'System32\conhost.exe'),
+
+    # This script runs before Import-Module (the module isn't loaded until the body below), so
+    # it cannot call the module's private Get-WslAutomationDefaultPwshPath helper and instead
+    # inlines the same MSI-preferring logic. An MSI PowerShell 7 (C:\Program Files\PowerShell\7)
+    # is both stable across updates and launchable from the non-interactive session 0 the S4U
+    # tasks run in; a Store pwsh (per-user WindowsApps alias, or a version-pinned
+    # "C:\Program Files\WindowsApps\Microsoft.PowerShell_<ver>_..." path that is removed on the
+    # next package update) cannot be activated in session 0, so it is only a fallback.
+    [string]$PwshPath = $(
+        $msiInstallPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+        $stableAliasPath = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'
+        if (Test-Path -LiteralPath $msiInstallPath) {
+            $msiInstallPath
+        }
+        elseif (Test-Path -LiteralPath $stableAliasPath) {
+            $stableAliasPath
+        }
+        else {
+            $resolvedPath = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+            $versionPinnedRoot = Join-Path $env:ProgramFiles 'WindowsApps'
+            if ($resolvedPath -and $resolvedPath.StartsWith($versionPinnedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                Write-Warning -Message ("Resolved pwsh.exe path '$resolvedPath' is a version-pinned Microsoft Store " +
+                    'package path and will break on the next PowerShell update. Pass -PwshPath explicitly with a ' +
+                    'stable MSI install path under C:\Program Files\PowerShell\7.')
+            }
+            $resolvedPath
+        }
+    ),
+
+    [string[]]$LegacyScriptsToArchive = @(),
+
+    [switch]$SkipTaskHistory
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot '..' 'src' 'WslAutomation') -Force
+
+try {
+    Set-WslAutomationScheduledTasks -ScriptsDir $ScriptsDir -DistroName $DistroName `
+        -CcstatuslineTaskName $CcstatuslineTaskName -CcstatuslineIntervalMinutes $CcstatuslineIntervalMinutes `
+        -PwshPath $PwshPath -MemoryLogTaskName $MemoryLogTaskName `
+        -MemoryLogIntervalMinutes $MemoryLogIntervalMinutes -MemoryLogDir $MemoryLogDir `
+        -CodexCloudEnvironmentSyncTaskName $CodexCloudEnvironmentSyncTaskName -EnableCodexTasks:$EnableCodexTasks `
+        -UsageCensusTaskName $UsageCensusTaskName -UsageCensusTime $UsageCensusTime `
+        -SessionMinerTaskName $SessionMinerTaskName -SessionMinerTime $SessionMinerTime `
+        -MemoryCurationTaskName $MemoryCurationTaskName -MemoryCurationTime $MemoryCurationTime `
+        -WaitingFeedTaskName $WaitingFeedTaskName `
+        -DockerWatchdogTaskName $DockerWatchdogTaskName -DockerWatchdogIntervalMinutes $DockerWatchdogIntervalMinutes `
+        -DockerWatchdogLogonDelayMinutes $DockerWatchdogLogonDelayMinutes -WslExePath $WslExePath -ConhostPath $ConhostPath `
+        -LegacyScriptsToArchive $LegacyScriptsToArchive -SkipTaskHistory:$SkipTaskHistory -WhatIf:$WhatIfPreference
+
+    exit 0
+}
+catch {
+    Write-Error -ErrorRecord $_
+    exit 1
+}
