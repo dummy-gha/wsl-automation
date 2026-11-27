@@ -1,22 +1,17 @@
 {
   "registry": "dummy-gha/acsi-agentskills",
-  "ref": "eeeb02f27120c0bd40e80ffe9e1d96000bdc3cea",
+  "ref": "69882ea5da69e81fbf5e4fb8627f88d39bef1309",
   "bundles": [
     "acsi-anything-anywhere",
     "acsi-coding-anywhere"
   ],
   "skills": {
-    "acsi-anything-anywhere/finding-unknowns": "sha256:de8ba4767b859db1109a6b866de913674f0d876205bd5293a55cdc55600f6a36",
-    "acsi-anything-anywhere/writing-adrs": "sha256:9dd694d2e39318ec5b3ff763c475a0ea2de3dc4eb1323ca9fdb4bd85fccbdb02",
-    "acsi-coding-anywhere/ci-job-performance": "sha256:83c331183416eeca814fc5608a93439d29e37d12580e3d32be7330cb3491a48d",
-    "acsi-coding-anywhere/disarm-inherited-reach": "sha256:0be479e716d574d8b2ef9868ad9a9d8c4b67413b98d5cf0ae331c79efc511ce2",
-    "acsi-coding-anywhere/fan-out-triage": "sha256:fa2be3d544133f9ddbb4f801807365fed66dbf9885650985c5b2e8337cf19af7",
-    "acsi-coding-anywhere/github-actions-repo-settings": "sha256:b8d280f4811efcb5a95536272263a635299f8665e86ca9295eb94f7a9b5e130a",
-    "acsi-coding-anywhere/red-ci-example-site-a-ai": "sha256:5ec63e5f61b3df9b9acb12eeb20d864f63cc283b27635ac9978269f30817b04c",
+    "acsi-coding-anywhere/disarm-inherited-reach": "sha256:c14d00151a925418416a0891551912778e7dbd98e8e44252e1827e50f048737e",
+    "acsi-coding-anywhere/github-actions-repo-settings": "sha256:598ddafb8d2ff0534ef32064b40a68354800303beca1c37477468adaf836396d",
     "acsi-coding-anywhere/review-bash-ci-reliability": "sha256:fc025b6ccc11282445b6ce1a465b1e80e2fbcbca3cbb66fc9ee1cdfce04dfe2c",
-    "acsi-coding-anywhere/skills-doctor": "sha256:ff81475d0f03394819baef5ff4ece5c47aadada40b3a1737c7b325a6a86d39ec",
+    "acsi-coding-anywhere/skills-doctor": "sha256:9ca62c4803926461e7d162bb4c6d9ac1ced73add636fb586d0ea7f5307eaa5fe",
     "acsi-coding-anywhere/vendor-release-impact-issues": "sha256:7c29bc5f0dc5f34ce510d9a98381d97eb6aa5528e28d903dbd8c304a12b10af1",
-    "acsi-coding-anywhere/workflow-path-audit": "sha256:0670bcc52f90c9ce2d22bf13acfcaccdc0c7953e5a4fa3406ffe8703611c9f34"
+    "acsi-coding-anywhere/workflow-path-audit": "sha256:ee592f8630f9ed7edb91b00ecdff18ccb9dbcbb76c21240b793da799bdfbc1e7"
   },
-  "generated_from": "eeeb02f27120c0bd40e80ffe9e1d96000bdc3cea"
+  "generated_from": "69882ea5da69e81fbf5e4fb8627f88d39bef1309"
 }
