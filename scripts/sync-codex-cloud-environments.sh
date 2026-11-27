@@ -19,8 +19,8 @@ readonly max_inventory_pages=100
 # .claude/hooks/skills-bootstrap.sh at that commit. Set both before the first
 # sync (the adoption kit's REGENERATE.md says how); the zeros fail closed: the
 # download 404s or the digest mismatches, and setup reports skills DEGRADED.
-readonly bootstrap_revision='0000000000000000000000000000000000000000'
-readonly bootstrap_sha256='0000000000000000000000000000000000000000000000000000000000000000'
+readonly bootstrap_revision='69882ea5da69e81fbf5e4fb8627f88d39bef1309'
+readonly bootstrap_sha256='7f962f0ab93ad4765e873d7c1abedf570f4910ee542c48460bafc506d2ebfcd8'
 # The fleet-guidance installer, pinned by commit and digest. Consumer repositories
 # no longer carry .claude/hooks/fleet-memory.sh (_agent-guidance ADR 0043), so
 # setup downloads this reviewed copy and verifies it before running it. The
@@ -32,8 +32,8 @@ readonly bootstrap_sha256='00000000000000000000000000000000000000000000000000000
 # and setup fails. Before the first sync, set both from your _agent-guidance
 # main: the adoption kit's bootstrap/regenerate.sh codex-pin does it, with the
 # commands above.
-readonly fleet_pin_commit='1111111111111111111111111111111111111111'
-readonly fleet_pin_sha256='1111111111111111111111111111111111111111111111111111111111111111'
+readonly fleet_pin_commit='6ef1721d799c9562818a9154bfbaf31d5fe16604'
+readonly fleet_pin_sha256='9bb5d7dd48cd72efb0b19575fdd6ecae75e23aab518c71b70552a16bebb0bf9b'
 
 dry_run=false
 connector_override="${CODEX_CLOUD_GITHUB_CONNECTOR_ID:-}"
